@@ -1,0 +1,303 @@
+name: Agent Fix
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]   # reviewer bot yang posting inline thread lewat event ini
+
+# NOTE: concurrency sengaja di LEVEL JOB (bukan workflow). Alasannya:
+# reply traceability agent-fix (via GH_PAT) memicu event pull_request_review /
+# pull_request_review_comment baru — 14 reply = 14 run baru dalam hitungan
+# detik. Dengan concurrency di level workflow, run-run sampah itu masuk queue
+# group yang sama dan MEMBATALKAN run legit yang sedang pending (GitHub hanya
+# menyimpan 1 pending per group). Di level job, run yang kondisi `if`-nya
+# false di-skip TANPA pernah menyentuh queue — tidak bisa membatalkan siapa pun.
+
+jobs:
+  fix:
+    # Queue runs per PR (don't cancel in-progress). Human /agent-fix waits for
+    # in-flight bot fix to finish; bot reviews mid-run queue behind it.
+    concurrency:
+      group: agent-fix-${{ github.event.pull_request.number || github.event.issue.number || github.event.comment.pull_request_url }}
+      cancel-in-progress: false
+    # Triggers (in priority order):
+    #  1. Human '/agent-fix' comment, either at PR-level (issue_comment) OR as
+    #     a reply inside a review thread (pull_request_review_comment). The
+    #     thread-reply form is common when humans hit "Reply" under a bot's
+    #     inline finding instead of opening a fresh PR comment.
+    #  2. Formal PR review from OpenCodeReview / Codacy / Cubic bot (pull_request_review)
+    #     — Bots submit formal reviews which fire ONE pull_request_review event
+    #       plus N pull_request_review_comment events. We trigger ONLY from the
+    #       pull_request_review event to avoid duplicate runs.
+    #  3. NOTE: pull_request_review_comment events from bots are intentionally
+    #     NOT triggered because they are always part of formal reviews (handled
+    #     by pull_request_review above). GitHub always populates pull_request_review_id
+    #     for inline comments, so we cannot distinguish standalone from review-wrapped
+    #     comments via null check. Instead, we exclude bot usernames from this trigger.
+    #     codacy/cubic dipertahankan dari LPMS-3 supaya kalau nanti integrasi itu
+    #     dipasang di repo ini, workflow-nya langsung jalan tanpa diedit lagi.
+    if: >
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '/agent-fix')) ||
+      (github.event_name == 'pull_request_review' && (contains(github.event.review.user.login, 'codacy') || contains(github.event.review.user.login, 'minimax') || contains(github.event.review.user.login, 'cubic') || contains(github.event.review.user.login, 'opencodereview') || contains(github.event.review.body, 'OpenCodeReview'))) ||
+      (github.event_name == 'pull_request_review_comment' && !contains(github.event.comment.user.login, 'codacy') && !contains(github.event.comment.user.login, 'minimax') && !contains(github.event.comment.user.login, 'cubic') && !contains(github.event.comment.user.login, 'opencodereview') && contains(github.event.comment.body, '/agent-fix'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    steps:
+      - name: Get PR info
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            PR_NUMBER=${{ github.event.issue.number }}
+          else
+            PR_NUMBER=${{ github.event.pull_request.number }}
+          fi
+          PR_INFO=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json headRefName,headRefOid)
+          PR_BRANCH=$(echo "$PR_INFO" | jq -r '.headRefName')
+          PR_SHA=$(echo "$PR_INFO" | jq -r '.headRefOid')
+          echo "number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "branch=$PR_BRANCH" >> $GITHUB_OUTPUT
+          echo "sha=$PR_SHA" >> $GITHUB_OUTPUT
+
+      # ── LOOP BREAKER ─────────────────────────────────────────────────
+      # ac-verify auto-triggers /agent-fix, agent-fix pushes trigger bot
+      # re-reviews, re-reviews trigger ac-verify again. Without a cap this
+      # loop can spin indefinitely on an AC the agent cannot satisfy.
+      # Cap BOT-triggered runs at 3 per PR; then label `needs-human` and
+      # stop. A human-typed /agent-fix comment always bypasses the cap —
+      # the human is the circuit-breaker reset.
+      - name: Loop breaker — cap bot-triggered fix iterations
+        id: loopbreak
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # A comment event is only "human" when the author is NOT a bot.
+          # ac-verify auto-triggers post '/agent-fix' issue comments via
+          # GITHUB_TOKEN (a Bot user) — those must COUNT toward the cap,
+          # otherwise the auto-loop bypasses its own circuit breaker.
+          IS_HUMAN=false
+          if { [ "${{ github.event_name }}" = "issue_comment" ] || \
+               [ "${{ github.event_name }}" = "pull_request_review_comment" ]; } && \
+             [ "${{ github.event.comment.user.type }}" != "Bot" ]; then
+            IS_HUMAN=true
+          fi
+
+          if [ "$IS_HUMAN" = "true" ]; then
+            echo "Human-triggered — bypassing loop cap."
+            echo "skip=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          RUNS=$(gh run list --repo ${{ github.repository }} \
+            --workflow agent-fix.yml --limit 50 \
+            --json headBranch,conclusion \
+            --jq "[.[] | select(.headBranch == \"${{ steps.pr.outputs.branch }}\" and .conclusion == \"success\")] | length" 2>/dev/null || echo 0)
+          echo "Previous successful agent-fix runs on this branch: $RUNS"
+
+          if [ "$RUNS" -ge 3 ]; then
+            echo "::warning::Loop cap reached ($RUNS runs). Escalating to human."
+            gh pr edit ${{ steps.pr.outputs.number }} --add-label needs-human 2>/dev/null || true
+            # Post escalation comment only once (marker-deduped)
+            MARKER="<!-- agent-fix-loop-cap -->"
+            EXISTING=$(gh api "repos/${{ github.repository }}/issues/${{ steps.pr.outputs.number }}/comments" --paginate \
+              | jq -r --arg m "$MARKER" '[.[] | select(.body | startswith($m))] | length')
+            if [ "$EXISTING" = "0" ]; then
+              gh pr comment ${{ steps.pr.outputs.number }} --body "$MARKER
+          ⛔ **Auto-fix loop stopped after $RUNS attempts.** Reviewer/verifier findings persist that the agent could not resolve automatically. A human decision is needed — reply with \`/agent-fix <directive>\` to resume with explicit instructions, or resolve manually."
+            fi
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout PR branch
+        if: steps.loopbreak.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Capture human directive from comment
+        # Fires for any human-typed /agent-fix — whether at PR-level (issue_comment)
+        # or inside a review thread reply (pull_request_review_comment).
+        if: >
+          steps.loopbreak.outputs.skip == 'false' &&
+          ((github.event_name == 'issue_comment' && contains(github.event.comment.body, '/agent-fix')) ||
+          (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '/agent-fix')))
+        id: human_directive
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          BODY="$COMMENT_BODY"
+          DIRECTIVE=$(echo "$BODY" | sed 's|^[[:space:]]*/agent-fix[[:space:]]*||')
+          echo "$DIRECTIVE" > human_directive.txt
+          DIRECTIVE_LEN=${#DIRECTIVE}
+          echo "Human directive length: $DIRECTIVE_LEN chars"
+          if [ "$DIRECTIVE_LEN" -gt 5 ]; then
+            echo "has_directive=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_directive=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup HDL toolchain (Verilator / Icarus / GHDL)
+        if: steps.loopbreak.outputs.skip == 'false'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends verilator iverilog
+          sudo apt-get install -y --no-install-recommends ghdl \
+            || echo "::warning::ghdl tidak tersedia di runner ini — pengecekan VHDL akan dilewati"
+          echo "--- versi toolchain ---"
+          verilator --version || true
+          iverilog -V 2>/dev/null | head -1 || true
+          ghdl --version 2>/dev/null | head -1 || true
+
+      - name: Setup Node.js
+        if: steps.loopbreak.outputs.skip == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code
+        if: steps.loopbreak.outputs.skip == 'false'
+        run: npm i -g @anthropic-ai/claude-code
+
+      - name: Stagger Start (avoid rate limit)
+        if: steps.loopbreak.outputs.skip == 'false'
+        run: |
+          WAIT=$((RANDOM % 60))
+          echo "Waiting ${WAIT}s to stagger API calls..."
+          sleep $WAIT
+
+      - name: Run Claude Code Agent Fix
+        if: steps.loopbreak.outputs.skip == 'false'
+        env:
+          # Gateway Anthropic-compatible. CLI menambahkan /v1/messages →
+          # URL final = https://rhkb7em.abc-tunnel.us/v1/messages
+          ANTHROPIC_BASE_URL: https://rhkb7em.abc-tunnel.us/v1
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.AGENT_API_KEY }}
+          ANTHROPIC_MODEL: agent-coding
+          ANTHROPIC_SMALL_FAST_MODEL: agent-coding
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ "${{ steps.human_directive.outputs.has_directive }}" = "true" ]; then
+            HUMAN_SECTION=$(cat <<HDIRECTIVE
+
+          ## PRIMARY HUMAN DIRECTIVE
+          A human reviewer triggered this fix with specific instructions. These take TOP PRIORITY over automated reviewer suggestions:
+          ---
+          $(cat human_directive.txt)
+          ---
+          Address the human directive FIRST, then process automated reviewer comments as usual.
+          HDIRECTIVE
+            )
+          else
+            HUMAN_SECTION=""
+          fi
+
+          MAX_RETRIES=3
+          RETRY=0
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            echo "=== Attempt $((RETRY+1)) of $MAX_RETRIES ==="
+            if claude -p "You are fixing PR #${{ steps.pr.outputs.number }} on branch '${{ steps.pr.outputs.branch }}'.
+          This repository is a hardware design project written in VHDL, Verilog and SystemVerilog.
+          ${HUMAN_SECTION}
+
+          1. Read the PR conversation comments using 'gh pr view ${{ steps.pr.outputs.number }} --comments'.
+          2. Read PR REVIEW SUMMARIES using 'gh api repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.number }}/reviews'. OpenCodeReview posts here as a formal PR review under a GitHub App identity whose login contains 'opencodereview'; its review body may be EMPTY with all findings as inline comments — do not skip it just because the body is blank. Process all unresolved reviews.
+          3. CRITICAL: Read INLINE LINE COMMENTS using 'gh api repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.number }}/comments --paginate'. Each entry has 'id', 'path', 'line' (or 'original_line'), 'body', 'user.login', 'pull_request_review_id'. Process EVERY entry authored by a bot (user.login containing 'opencodereview', 'codacy', or 'cubic') that is not yet replied to / resolved. Bot comments typically include a finding description and a suggested fix — implement the fix unless it violates CLAUDE.md or the RTL rules below.
+          4. CRITICAL: Read the AC-VERIFY REPORT using 'gh api repos/${{ github.repository }}/issues/${{ steps.pr.outputs.number }}/comments --paginate --jq \".[] | select(.body | startswith(\\\"<!-- ac-verify -->\\\")) | .body\"'. This returns a markdown table mapping each Acceptance Criterion to ✅ MET / ⚠️ PARTIAL / ❌ NOT MET / ❓ CANNOT VERIFY. ALSO check for **⚠️ IMPLICIT GAPS** in the Summary (modul tak terdaftar di filelist, latch tak sengaja, CDC tanpa sinkronisator, reset tak lengkap, testbench hilang, lebar bit tidak cocok). For every row that is PARTIAL, NOT MET, or flagged in IMPLICIT GAPS — implement the missing functionality. Do NOT skip ac-verify findings just because the code reviewer is satisfied; they check different things (reviewer = kualitas kode statis, ac-verify = cakupan acceptance criteria).
+          5. Check CI status using 'gh pr checks ${{ steps.pr.outputs.number }}'.
+
+          Your task:
+          - Evaluate each reviewer suggestion (OpenCodeReview, Codacy, Cubic, ac-verify, or human reviewers).
+          - First read CLAUDE.md if it exists — it holds the project's current HDL standards and takes priority.
+          - If the suggestion is valid and follows project standards, implement the fix.
+          - Before adding a signal, constant, library/use clause, or import, check the file for an existing identical declaration — duplicate declarations are a common cause of elaboration errors.
+
+          ## Aturan RTL WAJIB (berlaku untuk setiap perbaikan)
+
+            1. SystemVerilog: pakai always_ff / always_comb / always_latch untuk RTL baru,
+               bukan bare 'always' atau 'always @(*)'.
+            2. Sekuensial pakai non-blocking (<=); kombinasional pakai blocking (=).
+               Jangan campur dalam satu blok.
+            3. Hindari latch tak sengaja: di always_comb beri nilai default untuk setiap
+               output di awal blok, atau pastikan if/case lengkap (ada else / default).
+            4. Setiap 'case' harus punya 'default'.
+            5. Ikuti strategi reset modul tetangga (sinkron/asinkron, active-low/high).
+               Jangan campur gaya reset dalam satu clock domain.
+            6. Sinyal lintas clock domain WAJIB lewat sinkronisator (2-flop untuk single-bit,
+               handshake atau async FIFO untuk bus).
+            7. Jangan pakai konstruksi non-sintesis di RTL: delay (#), 'initial', \$display,
+               \$finish, 'real', fork/join — itu hanya untuk testbench.
+            8. VHDL: pakai ieee.numeric_std, JANGAN std_logic_arith / std_logic_unsigned.
+            9. Perhatikan lebar bit — hindari truncation/extension implisit, cast eksplisit.
+           10. Modul baru harus punya testbench yang self-checking dan benar-benar jalan.
+           11. Daftarkan setiap file baru ke filelist (.f) / Makefile / FuseSoC core /
+               project file vendor kalau repo ini memakainya.
+
+          ## Verifikasi sebelum push (WAJIB)
+
+          Jalankan lint/elaborate sesuai bahasa file yang kamu sentuh. Kalau repo punya
+          Makefile / script / filelist / FuseSoC core, PAKAI itu lebih dulu. Fallback:
+            - Verilog / SystemVerilog: 'verilator --lint-only -Wall <top>' dan
+              'iverilog -g2012 -o /tmp/sim <files> && vvp /tmp/sim'
+            - VHDL: 'ghdl -s <file>', 'ghdl -a <file>', 'ghdl -e <top> && ghdl -r <top>'
+          Toolchain verilator, iverilog dan ghdl sudah terpasang di runner ini.
+          Jangan push kalau lint masih error. Laporkan hasil lint/simulasi yang
+          sebenarnya — jangan mengarang hasil.
+
+          Commit and push any fixes FIRST. Capture the fix commit SHA — you will reference it in replies.
+
+          ── MANDATORY TRACEABILITY (post-fix) ──
+          For EVERY bot inline comment you addressed (fixed, deferred, or rebutted), you MUST post a REPLY on that comment thread so the human can trace which finding got which treatment. Do not skip this step — untraceable bulk fixes are the anti-pattern this rule exists to prevent.
+
+          For each inline comment with id={COMMENT_ID}, post a reply:
+            gh api -X POST repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.number }}/comments/{COMMENT_ID}/replies \
+              -f body='✅ Fixed in {SHORT_SHA} — {one-line summary of the change}'
+
+          For rebuttal (finding invalid or conflicts with CLAUDE.md / RTL rules):
+            gh api -X POST repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.number }}/comments/{COMMENT_ID}/replies \
+              -f body='🤔 Rebuttal: {reasoning, cite CLAUDE.md section or design rationale}'
+
+          For deferred (valid but out-of-scope for this PR):
+            gh api -X POST repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.number }}/comments/{COMMENT_ID}/replies \
+              -f body='⏭️ Deferred: {reason, and reference to follow-up issue if created}'
+
+          For the OpenCodeReview SUMMARY (review body, not inline), post a single issue comment recapping all decisions:
+            gh pr comment ${{ steps.pr.outputs.number }} --body \"## agent-fix response to OpenCodeReview
+            - Item 1 ({path}:{line}): ✅ Fixed in {SHA} — {summary}
+            - Item 2 ({path}:{line}): 🤔 Rebuttal — {reason}
+            - Item 3 (summary): ⏭️ Deferred — {reason}
+            (All inline comments have individual replies with the same disposition.)\"
+
+          IMPORTANT — DO NOT do any of the following (avoids racing the reviewer's re-review):
+          - DO NOT call resolveReviewThread (let the bots confirm the fix and let the human resolve)
+          - DO NOT call 'gh pr merge'
+          - DO NOT re-enable auto-merge
+          Push the fix commit, post per-comment replies and summary recap, then exit. The bots will re-review, then the human will merge." \
+          --dangerously-skip-permissions; then
+            echo "Claude Code Fix completed successfully"
+            exit 0
+          else
+            RETRY=$((RETRY+1))
+            if [ $RETRY -lt $MAX_RETRIES ]; then
+              BACKOFF=$((300 * RETRY))
+              echo "Claude Code Fix failed (likely rate limit). Retrying in ${BACKOFF}s..."
+              sleep $BACKOFF
+            else
+              echo "Claude Code Fix failed after $MAX_RETRIES attempts"
+              exit 1
+            fi
+          fi
+          done

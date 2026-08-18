@@ -1,0 +1,505 @@
+name: Agent Trigger
+
+# Alur dua tahap (plan-approval) — human-in-the-loop naik ke level desain:
+#   1. Label 'agent-task'     -> tahap PLAN: agent post komentar rencana (<!-- agent-plan -->) + label 'plan-posted'. TIDAK ada branch/PR.
+#   2. Label 'plan-approved'  -> tahap IMPLEMENT: agent baca rencana yang disetujui, buat branch feat/acsm-issue-N, lint, PR.
+#   Bypass: label 'fast-track' -> langsung IMPLEMENT tanpa plan (untuk issue kecil).
+#
+# Port dari repo LPMS-3, disesuaikan untuk proyek HDL (VHDL / Verilog / SystemVerilog):
+#   - Toolchain .NET diganti toolchain HDL (Verilator, Icarus Verilog, GHDL)
+#   - Guardrail AntDesign diganti guardrail RTL (latch, CDC, blocking/non-blocking, dll)
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'GitHub Issue number to work on'
+        required: true
+        type: string
+      mode:
+        description: 'Stage to run: plan (post rencana) or implement (langsung koding)'
+        required: false
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - implement
+  issues:
+    types: [labeled]
+
+# Limit concurrent agents to avoid API rate limits
+concurrency:
+  group: agent-queue-${{ github.event.issue.number || github.event.inputs.issue_number }}
+
+jobs:
+  agent:
+    # Trigger hanya untuk 3 label yang relevan (atau manual dispatch).
+    # Label lain di-ignore supaya job tidak jalan sia-sia.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'agent-task' ||
+      github.event.label.name == 'plan-approved' ||
+      github.event.label.name == 'fast-track'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code
+        run: npm i -g @anthropic-ai/claude-code
+
+      - name: Determine Issue Number
+        id: issue
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "number=${{ github.event.inputs.issue_number }}" >> $GITHUB_OUTPUT
+          else
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          fi
+
+      # Tentukan mode (plan vs implement) dari label yang men-trigger event.
+      # KENAPA cek label 'fast-track' lagi via gh: kalau issue sudah punya fast-track
+      # lalu dilabel agent-task, kita hormati bypass-nya dan langsung implement.
+      - name: Determine Mode
+        id: mode
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          MODE="plan"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODE="${{ github.event.inputs.mode || 'plan' }}"
+          else
+            case "${{ github.event.label.name }}" in
+              plan-approved|fast-track)
+                MODE="implement"
+                ;;
+              agent-task)
+                # Issue kecil dengan fast-track sudah terpasang -> skip tahap plan
+                HAS_FAST_TRACK=$(gh issue view "${{ steps.issue.outputs.number }}" --repo "${{ github.repository }}" --json labels --jq '[.labels[].name] | contains(["fast-track"])')
+                if [ "$HAS_FAST_TRACK" = "true" ]; then
+                  MODE="implement"
+                else
+                  MODE="plan"
+                fi
+                ;;
+            esac
+          fi
+          echo "Mode: $MODE"
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+
+      # Toolchain HDL hanya dibutuhkan tahap implement (lint/elaborate);
+      # tahap plan cukup baca kode.
+      - name: Setup HDL toolchain (Verilator / Icarus / GHDL)
+        if: steps.mode.outputs.mode == 'implement'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends verilator iverilog
+          # ghdl ada di repo 'universe' — jangan gagalkan job kalau paketnya tidak tersedia
+          sudo apt-get install -y --no-install-recommends ghdl \
+            || echo "::warning::ghdl tidak tersedia di runner ini — pengecekan VHDL akan dilewati"
+          echo "--- versi toolchain ---"
+          verilator --version || true
+          iverilog -V 2>/dev/null | head -1 || true
+          ghdl --version 2>/dev/null | head -1 || true
+
+      # Wait random 0-120 seconds to stagger concurrent agents and avoid rate limits
+      - name: Stagger Start (avoid rate limit)
+        run: |
+          WAIT=$((RANDOM % 120))
+          echo "Waiting ${WAIT}s to stagger API calls..."
+          sleep $WAIT
+
+      # ============================================================
+      # TAHAP 1: PLAN — agent menulis rencana implementasi sebagai
+      # komentar issue, TANPA membuat branch/PR. Human review rencana,
+      # lalu memberi label 'plan-approved' untuk lanjut ke tahap 2.
+      # ============================================================
+      - name: Run Claude Code Agent (Plan)
+        if: steps.mode.outputs.mode == 'plan'
+        id: claude_plan
+        env:
+          # Gateway Anthropic-compatible. CLI menambahkan /v1/messages otomatis →
+          # URL final = https://rhkb7em.abc-tunnel.us/v1/messages
+          ANTHROPIC_BASE_URL: https://rhkb7em.abc-tunnel.us/v1
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.AGENT_API_KEY }}
+          ANTHROPIC_MODEL: agent-coding
+          ANTHROPIC_SMALL_FAST_MODEL: agent-coding
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          MAX_RETRIES=3
+          RETRY=0
+
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            echo "=== Attempt $((RETRY+1)) of $MAX_RETRIES (PLAN stage) ==="
+
+            if claude -p "Read GitHub issue #${{ steps.issue.outputs.number }} using 'gh issue view ${{ steps.issue.outputs.number }}'.
+
+          You are in PLANNING mode. DO NOT write code, DO NOT create a branch, DO NOT open a PR.
+
+          This repository is a hardware design project written in VHDL, Verilog and SystemVerilog.
+          Explore the relevant sources (RTL modules, packages, testbenches, constraint files,
+          filelists such as .f, Makefile / FuseSoC / vendor project files) and docs/architecture.md
+          if it exists, then produce a concise implementation plan for this issue.
+          Read CLAUDE.md first if it exists — it holds the project's HDL conventions.
+
+          Post the plan as a comment on issue #${{ steps.issue.outputs.number }} using:
+            gh issue comment ${{ steps.issue.outputs.number }} --body '<plan>'
+
+          The comment body MUST start with the exact marker line:
+            <!-- agent-plan -->
+          (this marker is how the implement stage finds the approved plan later).
+
+          The plan must cover, in short bullet form:
+            - File yang akan disentuh (path + apa yang berubah)
+            - Hirarki modul & port map (nama modul, arah port, lebar bit)
+            - Clock & reset domain yang terlibat, termasuk CDC bila ada
+            - FSM: daftar state + transisi (bila ada)
+            - Interface/protokol yang dipakai (AXI4-Lite, APB, Avalon, Wishbone, handshake custom, dll)
+            - Rencana verifikasi: testbench mana yang dibuat/diubah, skenario apa,
+              tool yang dipakai (Icarus Verilog / Verilator / GHDL)
+            - Risiko & dependensi (timing, resource/utilisasi, dependensi modul lain)
+            - Estimasi cakupan (small/medium/large + perkiraan jumlah file)
+
+          After posting the comment, add the label 'plan-posted' to the issue:
+            gh issue edit ${{ steps.issue.outputs.number }} --add-label plan-posted
+
+          Remember: NO code changes, NO branch, NO PR at this stage. A human will review
+          the plan and add the 'plan-approved' label to trigger implementation." \
+              --dangerously-skip-permissions; then
+              CLAUDE_EXIT=0
+            else
+              CLAUDE_EXIT=$?
+            fi
+
+            if [ $CLAUDE_EXIT -ne 0 ]; then
+              RETRY=$((RETRY+1))
+              if [ $RETRY -lt $MAX_RETRIES ]; then
+                BACKOFF=$((60 * RETRY))
+                echo "Claude Code failed with exit code $CLAUDE_EXIT (likely rate limit). Retrying in ${BACKOFF}s..."
+                sleep $BACKOFF
+                continue
+              else
+                echo "Claude Code failed after $MAX_RETRIES attempts"
+                exit 1
+              fi
+            fi
+
+            # Exit 0 — verifikasi artefak tahap PLAN (false-success detection).
+            # Artefak plan = komentar dengan marker <!-- agent-plan --> + label plan-posted.
+            echo "Claude Code exited 0 — verifying plan artifacts..."
+
+            ISSUE_NUM="${{ steps.issue.outputs.number }}"
+            VERIFICATION_FAILED=false
+
+            # Check 1: komentar rencana dengan marker ada di issue
+            PLAN_COMMENT_COUNT=$(gh issue view "$ISSUE_NUM" --json comments --jq '[.comments[] | select(.body | contains("<!-- agent-plan -->"))] | length')
+            echo "plan_comment_count=${PLAN_COMMENT_COUNT}" >> $GITHUB_OUTPUT
+            if [ "$PLAN_COMMENT_COUNT" -ge 1 ]; then
+              echo "✅ Plan comment with <!-- agent-plan --> marker found on issue #$ISSUE_NUM"
+            else
+              echo "❌ No plan comment with <!-- agent-plan --> marker on issue #$ISSUE_NUM"
+              VERIFICATION_FAILED=true
+            fi
+
+            # Check 2: label plan-posted terpasang
+            HAS_PLAN_POSTED=$(gh issue view "$ISSUE_NUM" --json labels --jq '[.labels[].name] | contains(["plan-posted"])')
+            echo "plan_posted_label=${HAS_PLAN_POSTED}" >> $GITHUB_OUTPUT
+            if [ "$HAS_PLAN_POSTED" = "true" ]; then
+              echo "✅ Label 'plan-posted' present on issue #$ISSUE_NUM"
+            else
+              # Komentar ada tapi label lupa? Pasang sendiri daripada retry agent penuh —
+              # lebih murah dan hasil akhirnya sama.
+              if [ "$PLAN_COMMENT_COUNT" -ge 1 ]; then
+                echo "⚠️ Label missing but plan comment exists — adding 'plan-posted' label directly"
+                gh issue edit "$ISSUE_NUM" --add-label plan-posted
+                echo "plan_posted_label=true" >> $GITHUB_OUTPUT
+              else
+                VERIFICATION_FAILED=true
+              fi
+            fi
+
+            if [ "$VERIFICATION_FAILED" = true ]; then
+              echo "::error::Agent exited 0 but plan verification failed — no plan comment posted. Likely silent failure (gateway timeout, empty response)."
+              RETRY=$((RETRY+1))
+              if [ $RETRY -lt $MAX_RETRIES ]; then
+                BACKOFF=$((60 * RETRY))
+                echo "Retrying in ${BACKOFF}s due to verification failure..."
+                sleep $BACKOFF
+                continue
+              else
+                echo "Claude Code failed plan verification after $MAX_RETRIES attempts"
+                exit 1
+              fi
+            fi
+
+            echo "All plan verification checks passed"
+            exit 0
+          done
+
+      # ============================================================
+      # TAHAP 2: IMPLEMENT — jalan saat label 'plan-approved' (rencana
+      # sudah di-review human) atau 'fast-track' (bypass, issue kecil).
+      # Alur: branch feat/acsm-issue-N -> implement -> lint/elaborate -> PR.
+      # ============================================================
+
+      # Preflight check: plan-approved label WAJIB punya komentar <!-- agent-plan -->.
+      # Mencegah skenario label dipasang manual atau komentar rencana terhapus —
+      # tanpa gate ini, prompt implement diam-diam jatuh ke mode issue-body-only
+      # (perilaku fast-track), yang mementahkan human-in-the-loop plan approval.
+      - name: Preflight — Plan Comment Must Exist (plan-approved trigger)
+        if: steps.mode.outputs.mode == 'implement' && github.event.label.name == 'plan-approved'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          ISSUE_NUM="${{ steps.issue.outputs.number }}"
+          PLAN_COUNT=$(gh issue view "$ISSUE_NUM" --json comments \
+            --jq '[.comments[] | select(.body | contains("<!-- agent-plan -->"))] | length')
+          if [ "$PLAN_COUNT" -eq 0 ]; then
+            echo "::error::Triggered by plan-approved label but NO <!-- agent-plan --> comment found on issue #$ISSUE_NUM."
+            echo "::error::A plan must be posted and approved before implementation can start."
+            echo "::error::To create a plan, apply the 'agent-task' label first, then 'plan-approved' after reviewing the plan."
+            echo "::error::If this is a small change that does not need a plan, use the 'fast-track' label instead."
+            exit 1
+          fi
+          echo "✅ Plan comment with <!-- agent-plan --> marker found — proceeding with implementation"
+
+      - name: Run Claude Code Agent (Implement)
+        if: steps.mode.outputs.mode == 'implement'
+        id: claude
+        env:
+          ANTHROPIC_BASE_URL: https://rhkb7em.abc-tunnel.us/v1
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.AGENT_API_KEY }}
+          ANTHROPIC_MODEL: agent-coding
+          ANTHROPIC_SMALL_FAST_MODEL: agent-coding
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          MAX_RETRIES=3
+          RETRY=0
+
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            echo "=== Attempt $((RETRY+1)) of $MAX_RETRIES (IMPLEMENT stage) ==="
+
+            if claude -p "Read GitHub issue #${{ steps.issue.outputs.number }} using 'gh issue view ${{ steps.issue.outputs.number }}'.
+
+          ## Approved plan (WAJIB dibaca dulu)
+
+          Check the issue comments for the LATEST comment starting with the marker
+          '<!-- agent-plan -->' using:
+            gh issue view ${{ steps.issue.outputs.number }} --comments
+          That comment is the implementation plan a human has reviewed and approved.
+          FOLLOW that plan (files, module hierarchy, port map, FSM, verification plan).
+          If you must deviate from the plan for a good technical reason, you MUST explain
+          the deviation and its reason in a 'Deviations from plan' section in the PR body.
+          If no such comment exists, READ THE ISSUE LABELS: only proceed without a plan
+          if the issue has the 'fast-track' label. For any other scenario (including
+          'plan-approved' with no plan comment), stop and exit — do NOT implement
+          without an approved plan.
+
+          Create a feature branch from main named 'feat/acsm-issue-${{ steps.issue.outputs.number }}'.
+
+          This repository is a hardware design project in VHDL, Verilog and SystemVerilog.
+          Implement the requested change following the existing patterns in this repo:
+          naming style, file layout, package/library usage, filelist or build script,
+          and the reset/clock strategy already used by neighbouring modules.
+          Read CLAUDE.md first if it exists — it holds the project's HDL conventions and
+          takes priority over your defaults. Reference docs/architecture.md if present.
+
+          ## Aturan RTL WAJIB (HDL guardrails)
+
+          Melanggar aturan berikut menghasilkan bug hardware yang sering lolos dari
+          simulasi fungsional dasar tapi gagal saat sintesis atau di silikon.
+          Jangan menebak — kalau ragu, ikuti pola modul yang sudah ada di repo ini.
+
+            1. SystemVerilog: gunakan always_ff / always_comb / always_latch untuk RTL baru.
+               JANGAN pakai bare 'always' atau 'always @(*)' untuk logika sintesis baru.
+            2. Blok sekuensial pakai non-blocking assignment (<=); blok kombinasional
+               pakai blocking (=). Jangan campur keduanya di dalam satu blok.
+            3. Hindari latch tak sengaja: di always_comb, beri nilai default untuk SETIAP
+               sinyal output di awal blok, atau pastikan if/case-nya lengkap (ada else /
+               ada default). Ini penyebab bug paling sering di RTL yang ditulis agent.
+            4. Setiap 'case' harus punya cabang 'default'. Pakai unique/priority hanya
+               kalau memang benar-benar dijamin oleh desain — kalau ragu, jangan.
+            5. Reset: ikuti strategi reset yang sudah dipakai modul tetangga (sinkron vs
+               asinkron, active-low vs active-high). Jangan mencampur gaya reset dalam
+               satu clock domain.
+            6. Clock domain crossing: setiap sinyal yang menyeberang clock domain WAJIB
+               lewat sinkronisator — 2-flop synchronizer untuk single-bit, handshake atau
+               async FIFO untuk bus/multi-bit. Jangan pernah sampling langsung antar domain.
+            7. Jangan pakai konstruksi non-sintesis di dalam RTL: delay (#), blok 'initial',
+               \$display, \$finish, tipe 'real', fork/join. Itu hanya boleh di testbench.
+            8. VHDL: pakai ieee.numeric_std (signed/unsigned). JANGAN pakai std_logic_arith,
+               std_logic_unsigned, atau std_logic_signed. Port pakai std_logic /
+               std_logic_vector.
+            9. Perhatikan lebar bit — hindari truncation atau extension implisit.
+               Lakukan resize/cast secara eksplisit.
+           10. Setiap modul RTL baru harus punya testbench minimal yang benar-benar bisa
+               dijalankan (bukan sekadar lolos kompilasi), dan testbench itu harus punya
+               self-check (assertion atau perbandingan terhadap nilai harapan) — bukan
+               cuma waveform dump.
+           11. Kalau repo punya filelist (.f), Makefile, FuseSoC .core, atau project file
+               vendor, DAFTARKAN setiap file baru di situ. Modul yang tidak terdaftar
+               tidak ikut terbangun dan bug-nya baru ketahuan jauh di belakang.
+
+          ## Verifikasi sebelum bikin PR (WAJIB)
+
+          Jalankan lint/elaborate sesuai bahasa file yang kamu sentuh. Kalau repo sudah
+          punya Makefile, script, filelist (.f), atau FuseSoC core — PAKAI itu lebih dulu.
+          Fallback kalau repo belum punya build system:
+
+            - Verilog / SystemVerilog:
+                verilator --lint-only -Wall <top/file>
+                iverilog -g2012 -o /tmp/sim <files> && vvp /tmp/sim
+            - VHDL:
+                ghdl -s <file>                    (syntax check)
+                ghdl -a <file>                    (analyze)
+                ghdl -e <top> && ghdl -r <top>    (elaborate + run testbench)
+
+          Toolchain verilator, iverilog dan ghdl sudah terpasang di runner ini.
+          JANGAN membuat PR kalau lint masih error atau testbench masih gagal.
+          Laporkan output lint/simulasi yang sebenarnya di PR body — jangan mengarang hasil.
+
+          Then create a PR targeting main using:
+            gh pr create --title '<conventional commit title>' \
+              --label 'agent-generated' \
+              --body '<PR body with: Summary, daftar modul yang ditambah/diubah beserta tabel port, hasil lint/elaborate yang sebenarnya, hasil testbench, Test plan, Deviations from plan (if any)>'
+
+          DO NOT enable auto-merge. Let the automated reviewers run first; the human will
+          merge manually after review passes.
+
+          Post the PR URL as a comment on issue #${{ steps.issue.outputs.number }}." \
+              --dangerously-skip-permissions; then
+              CLAUDE_EXIT=0
+            else
+              CLAUDE_EXIT=$?
+            fi
+
+            if [ $CLAUDE_EXIT -ne 0 ]; then
+              RETRY=$((RETRY+1))
+              if [ $RETRY -lt $MAX_RETRIES ]; then
+                BACKOFF=$((60 * RETRY))
+                echo "Claude Code failed with exit code $CLAUDE_EXIT (likely rate limit). Retrying in ${BACKOFF}s..."
+                sleep $BACKOFF
+                continue
+              else
+                echo "Claude Code failed after $MAX_RETRIES attempts"
+                exit 1
+              fi
+            fi
+
+            # Exit 0 — verify artifacts exist (false-success detection)
+            echo "Claude Code exited 0 — verifying artifacts..."
+
+            ISSUE_NUM="${{ steps.issue.outputs.number }}"
+            BRANCH="feat/acsm-issue-${ISSUE_NUM}"
+            VERIFICATION_FAILED=false
+
+            # Check 1: branch pushed to remote
+            if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+              echo "✅ Branch '$BRANCH' exists on remote"
+              echo "branch_exists=true" >> $GITHUB_OUTPUT
+            else
+              echo "❌ Branch '$BRANCH' NOT found on remote"
+              echo "branch_exists=false" >> $GITHUB_OUTPUT
+              VERIFICATION_FAILED=true
+            fi
+
+            # Check 2: PR opened pointing to that branch
+            PR_COUNT=$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')
+            echo "pr_count=${PR_COUNT}" >> $GITHUB_OUTPUT
+            if [ "$PR_COUNT" -ge 1 ]; then
+              PR_URL=$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url')
+              echo "✅ PR opened: $PR_URL"
+            else
+              echo "❌ No PR found for branch '$BRANCH'"
+              VERIFICATION_FAILED=true
+            fi
+
+            # Check 3: agent left a comment on the issue
+            COMMENT_COUNT=$(gh issue view "$ISSUE_NUM" --json comments --jq '[.comments[] | select(.author.login == "github-actions[bot]" or .author.login == "hargithub-bot")] | length')
+            echo "comment_count=${COMMENT_COUNT}" >> $GITHUB_OUTPUT
+            if [ "$COMMENT_COUNT" -ge 1 ]; then
+              echo "✅ Agent comment found on issue #$ISSUE_NUM"
+            else
+              echo "⚠️ No agent comment on issue #$ISSUE_NUM (may not be critical)"
+            fi
+
+            if [ "$VERIFICATION_FAILED" = true ]; then
+              echo "::error::Agent exited 0 but verification failed — no branch/PR created. Likely silent failure (gateway timeout, empty response, or trust dialog issue)."
+              RETRY=$((RETRY+1))
+              if [ $RETRY -lt $MAX_RETRIES ]; then
+                BACKOFF=$((60 * RETRY))
+                echo "Retrying in ${BACKOFF}s due to verification failure..."
+                sleep $BACKOFF
+                continue
+              else
+                echo "Claude Code failed verification after $MAX_RETRIES attempts"
+                exit 1
+              fi
+            fi
+
+            # All checks passed
+            echo "All verification checks passed"
+            exit 0
+          done
+
+      - name: Write Job Summary (Plan)
+        if: always() && steps.mode.outputs.mode == 'plan'
+        env:
+          PLAN_COMMENT_COUNT: ${{ steps.claude_plan.outputs.plan_comment_count }}
+          PLAN_POSTED_LABEL: ${{ steps.claude_plan.outputs.plan_posted_label }}
+        run: |
+          ISSUE_NUM="${{ steps.issue.outputs.number }}"
+          {
+            echo "## Agent Verification (Plan stage)"
+            echo ""
+            echo "| Check | Status |"
+            echo "|-------|--------|"
+            echo "| Plan comment (\`<!-- agent-plan -->\`) | $([ "${PLAN_COMMENT_COUNT:-0}" -ge 1 ] && echo "✅ Posted" || echo "❌ Not found") |"
+            echo "| Label \`plan-posted\` | $([ "$PLAN_POSTED_LABEL" = "true" ] && echo "✅ Added" || echo "❌ Missing") |"
+            echo ""
+            echo "Next step: human reviews the plan on issue #$ISSUE_NUM, then adds label \`plan-approved\` to trigger implementation."
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Write Job Summary (Implement)
+        if: always() && steps.mode.outputs.mode == 'implement'
+        env:
+          BRANCH_EXISTS: ${{ steps.claude.outputs.branch_exists }}
+          PR_COUNT: ${{ steps.claude.outputs.pr_count }}
+          COMMENT_COUNT: ${{ steps.claude.outputs.comment_count }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          ISSUE_NUM="${{ steps.issue.outputs.number }}"
+          BRANCH="feat/acsm-issue-${ISSUE_NUM}"
+          PR_URL=""
+
+          if [ "${PR_COUNT:-0}" -ge 1 ]; then
+            PR_URL=$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url' 2>/dev/null || echo "")
+          fi
+
+          {
+            echo "## Agent Verification (Implement stage)"
+            echo ""
+            echo "| Check | Status |"
+            echo "|-------|--------|"
+            echo "| Branch \`$BRANCH\` | $([ "$BRANCH_EXISTS" = "true" ] && echo "✅ Exists" || echo "❌ Not found") |"
+            echo "| Pull Request | $([ "${PR_COUNT:-0}" -ge 1 ] && echo "✅ [$PR_COUNT open]($PR_URL)" || echo "❌ None") |"
+            echo "| Issue Comment | $([ "${COMMENT_COUNT:-0}" -ge 1 ] && echo "✅ Posted" || echo "⚠️ Not found") |"
+            echo ""
+            if [ "${PR_COUNT:-0}" -ge 1 ] && [ -n "$PR_URL" ]; then
+              echo "**PR URL:** $PR_URL"
+            fi
+          } >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,120 @@
+name: AC-SM Feature Request (HDL)
+description: Ajukan perubahan/penambahan desain RTL untuk ac-sm_IaC (VHDL / Verilog / SystemVerilog)
+labels: ["agent-task"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Issue yang dibuat dengan template ini otomatis dapat label `agent-task`,
+        yang memicu **tahap PLAN**: agent akan membalas dengan rencana implementasi.
+        Review rencananya, lalu beri label `plan-approved` untuk memicu implementasi.
+        Untuk perubahan kecil yang tidak perlu rencana, pakai label `fast-track`.
+  - type: textarea
+    id: description
+    attributes:
+      label: Deskripsi
+      description: Jelaskan fungsi hardware yang diminta
+      placeholder: "Sebagai [peran], saya ingin [fungsi] supaya [manfaat]"
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      description: |
+        Daftar kriteria yang harus dipenuhi. Ini yang dibaca workflow `ac-verify`
+        untuk menilai PR — tulis yang bisa diverifikasi dari diff.
+      placeholder: |
+        - [ ] Modul `fifo_ctrl` punya port `wr_en`, `rd_en`, `full`, `empty`
+        - [ ] FSM punya state IDLE / LOAD / RUN / DONE
+        - [ ] Testbench self-checking untuk kondisi full dan empty
+        - [ ] Lint Verilator bersih tanpa warning
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area yang Terpengaruh
+      description: Bagian mana yang perlu diubah?
+      multiple: true
+      options:
+        - RTL (modul desain)
+        - Testbench / verifikasi
+        - Package / library bersama
+        - Constraint (SDC / XDC / timing / pin)
+        - Build (filelist .f / Makefile / FuseSoC / project vendor)
+        - Dokumentasi
+    validations:
+      required: true
+  - type: dropdown
+    id: language
+    attributes:
+      label: Bahasa HDL
+      description: Bahasa yang dipakai untuk perubahan ini
+      multiple: true
+      options:
+        - SystemVerilog
+        - Verilog
+        - VHDL
+    validations:
+      required: true
+  - type: textarea
+    id: ports
+    attributes:
+      label: Modul & Port
+      description: Nama modul beserta daftar port (arah + lebar bit)
+      placeholder: |
+        Modul: `fifo_ctrl`
+        - `clk`      : in  std_logic
+        - `rst_n`    : in  std_logic  (async, active-low)
+        - `wr_en`    : in  std_logic
+        - `din`      : in  std_logic_vector(31 downto 0)
+        - `full`     : out std_logic
+    validations:
+      required: false
+  - type: textarea
+    id: clock-reset
+    attributes:
+      label: Clock & Reset Domain
+      description: Domain clock yang terlibat, strategi reset, dan CDC bila ada
+      placeholder: |
+        - Clock: `clk_sys` 100 MHz
+        - Reset: `rst_n` asinkron active-low, dilepas secara sinkron
+        - CDC: `done_pulse` menyeberang dari `clk_sys` ke `clk_io` → butuh 2-FF synchronizer
+    validations:
+      required: false
+  - type: textarea
+    id: interface
+    attributes:
+      label: Interface / Protokol
+      description: Protokol bus atau handshake yang dipakai
+      placeholder: "AXI4-Lite slave, APB, Avalon-MM, Wishbone, atau handshake valid/ready custom"
+    validations:
+      required: false
+  - type: textarea
+    id: verification
+    attributes:
+      label: Rencana Verifikasi
+      description: Testbench apa yang dibuat/diubah, skenario apa, tool apa
+      placeholder: |
+        - `tb_fifo_ctrl.sv` — tulis sampai full, baca sampai empty, cek assertion
+        - Tool: Icarus Verilog (`iverilog -g2012`) + Verilator lint
+        - Skenario corner: write & read bersamaan, reset di tengah transaksi
+    validations:
+      required: false
+  - type: input
+    id: depends-on
+    attributes:
+      label: Depends On
+      description: Nomor issue yang harus selesai lebih dulu
+      placeholder: "#1, #2"
+    validations:
+      required: false
+  - type: textarea
+    id: references
+    attributes:
+      label: Referensi
+      description: Modul, datasheet, atau spec yang jadi acuan
+      placeholder: "Ikuti pola handshake di rtl/axi_lite_slave.sv; lihat docs/architecture.md"
+    validations:
+      required: false

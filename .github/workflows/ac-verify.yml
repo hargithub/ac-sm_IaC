@@ -1,0 +1,521 @@
+name: AC Verify
+
+# Runs an INDEPENDENT acceptance-criteria check using the 'agent-verify' model
+# (different model family from the agent that writes the code). Posts a markdown
+# table comment on the PR mapping each AC item to MET / PARTIAL / NOT MET /
+# CANNOT VERIFY with file:line evidence.
+#
+# Trigger strategy: only fires AFTER a static reviewer (OpenCodeReview) has
+# reviewed and the PR is in a clean / mergeable state. This means the loop:
+#   PR opened → OCR review → agent-fix → OCR re-review → ... → CLEAN
+#                                                                 ↓
+#                                                         AC-verify runs ONCE
+# Avoids spamming on every intermediate commit while agent-fix is still
+# iterating on the reviewer's code-quality findings.
+#
+# Port dari repo LPMS-3, disesuaikan untuk proyek HDL (VHDL/Verilog/SystemVerilog):
+#   - System prompt verifier diganti ke konteks RTL
+#   - Implicit-gap checks diganti pola bug hardware (latch, CDC, reset, filelist, dst)
+#   - Poll ci-cd.yml dibuat fail-safe: repo ini belum punya workflow CI, jadi
+#     `gh run list --workflow ci-cd.yml` akan error → di-fallback ke 0 supaya
+#     gate tidak menggantung sampai timeout.
+
+on:
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  # Fallback trigger: review-event triggers proved unreliable in LPMS-3 —
+  # agent-fix traceability replies fire pull_request_review_comment events
+  # that race the settle/poll gate, so some PRs saw consecutive SKIPPED runs
+  # and never got an AC report. workflow_run after a green CI build is a
+  # stable signal: code compiled, checks settling.
+  # CATATAN: repo ini belum punya workflow bernama "CI/CD Pipeline", jadi
+  # trigger ini belum pernah menyala — dibiarkan supaya begitu workflow CI
+  # ditambahkan (dengan nama itu), fallback-nya langsung aktif tanpa edit.
+  workflow_run:
+    workflows: ["CI/CD Pipeline"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to verify (manual trigger)'
+        required: true
+        type: string
+
+# NOTE: concurrency di LEVEL JOB (bukan workflow) — reply traceability agent-fix
+# memicu puluhan event review dalam hitungan detik; di level workflow run-run
+# ber-`if` false itu tetap masuk queue group dan membatalkan run legit yang
+# pending. Di level job, run yang if-nya false di-skip tanpa menyentuh queue.
+
+jobs:
+  verify:
+    concurrency:
+      group: ac-verify-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.event.workflow_run.head_branch || github.event.comment.pull_request_url }}
+      # cancel-in-progress: false — biarkan burst komentar reviewer antre serial.
+      # Settle delay 45s + gate mergeStateStatus di dalam job sudah mendedupe.
+      # Cancel di layer concurrency pernah bikin SEMUA run burst saling batal
+      # sampai tidak ada satu pun yang mencapai gate.
+      cancel-in-progress: false
+    # Triggers:
+    #   - Formal PR review dari reviewer bot (pull_request_review)
+    #   - Inline thread comment dari reviewer bot (pull_request_review_comment)
+    #   - manual workflow_dispatch (human re-run untuk PR mana pun)
+    #
+    # OCR (OpenCodeReview) bisa posting sebagai GitHub App-nya sendiri ATAU sebagai
+    # github-actions[bot] kalau app token belum dipasang — makanya dideteksi lewat
+    # marker body 'OpenCodeReview' juga, bukan cuma user.login.
+    # codacy/cubic dipertahankan dari LPMS-3 supaya kalau integrasi itu dipasang
+    # nanti, workflow ini langsung ikut jalan.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request') ||
+      (github.event_name == 'pull_request_review' && (contains(github.event.review.user.login, 'codacy') || contains(github.event.review.user.login, 'cubic') || contains(github.event.review.user.login, 'opencodereview') || contains(github.event.review.body, 'OpenCodeReview'))) ||
+      (github.event_name == 'pull_request_review_comment' && (contains(github.event.comment.user.login, 'codacy') || contains(github.event.comment.user.login, 'cubic') || contains(github.event.comment.user.login, 'opencodereview') || contains(github.event.comment.body, 'OpenCodeReview')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gate — wait for downstream workflows to settle, then check mergeability
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WR_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          # Resolve PR number per event type. For workflow_run prefer the
+          # payload's linked pull_requests (exact, avoids cross-PR misrouting
+          # when branch names collide); fall back to head-branch lookup.
+          # HEAD_BRANCH passed via env (not inline interpolation) so a crafted
+          # branch name cannot inject into the shell.
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            PR_NUM="${{ github.event.workflow_run.pull_requests[0].number }}"
+            if [ -z "$PR_NUM" ]; then
+              PR_NUM=$(gh pr list --head "$WR_HEAD_BRANCH" --state open --json number --jq '.[0].number // empty')
+            fi
+            if [ -z "$PR_NUM" ]; then
+              echo "No open PR for branch $WR_HEAD_BRANCH — nothing to verify."
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            PR_BRANCH=$(gh pr view "$PR_NUM" --json headRefName -q .headRefName)
+          else
+            PR_NUM=${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+            PR_BRANCH=$(gh pr view $PR_NUM --json headRefName -q .headRefName)
+          fi
+          echo "pr=$PR_NUM" >> $GITHUB_OUTPUT
+          echo "PR #$PR_NUM on branch $PR_BRANCH"
+
+          # ─────────────────────────────────────────────────────────────────
+          # MANUAL TRIGGER BYPASS
+          # When fired via workflow_dispatch (gh workflow run), assume the
+          # human knows the PR is ready to verify. Skip settle/poll/mergeable
+          # checks — those gates exist to dedupe reviewer comment bursts and
+          # avoid racing agent-fix, neither of which apply to manual runs.
+          # ─────────────────────────────────────────────────────────────────
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual workflow_dispatch — bypassing settle/poll/mergeable gates."
+            echo "skip=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # ─────────────────────────────────────────────────────────────────
+          # PHASE 1 — Settle delay
+          # The same pull_request_review event fires BOTH agent-fix.yml and
+          # ac-verify.yml simultaneously. Give agent-fix a head start so its
+          # run shows up in `gh run list` (otherwise it might still be
+          # "queued" → invisible to --status in_progress).
+          # Also: reviewers post many inline pull_request_review_comment events
+          # in quick succession (one per file:line finding) — a 45s sleep here
+          # dedupes those bursts naturally.
+          # ─────────────────────────────────────────────────────────────────
+          echo "Settling delay: 45s (let agent-fix start + dedupe reviewer comment bursts)..."
+          sleep 45
+
+          # ─────────────────────────────────────────────────────────────────
+          # PHASE 2 — Poll for in-flight workflows that would race with us
+          # Wait until agent-fix (dan CI, kalau nanti ada) idle untuk branch
+          # PR ini. Poll tiap 30s, menyerah setelah ~10 menit.
+          # Fallback '|| echo 0': kalau workflow yang di-query belum ada di
+          # repo, gh keluar dengan error dan hasilnya kosong — tanpa fallback
+          # perbandingan string di bawah selalu false dan gate menggantung
+          # sampai timeout tanpa pernah menjalankan verifikasi.
+          # ─────────────────────────────────────────────────────────────────
+          MAX_WAIT=20  # 20 × 30s = 10 min
+          ATTEMPT=0
+          while [ $ATTEMPT -lt $MAX_WAIT ]; do
+            FIX_BUSY=$(gh run list --repo ${{ github.repository }} \
+              --workflow agent-fix.yml --limit 10 \
+              --json status,headBranch \
+              --jq "[.[] | select(.headBranch == \"$PR_BRANCH\" and .status != \"completed\")] | length" 2>/dev/null || echo 0)
+            [ -z "$FIX_BUSY" ] && FIX_BUSY=0
+
+            # CI belum ada di repo ini — query-nya akan gagal dan jatuh ke 0.
+            CI_BUSY=$(gh run list --repo ${{ github.repository }} \
+              --workflow ci-cd.yml --limit 10 \
+              --json status,headBranch \
+              --jq "[.[] | select(.headBranch == \"$PR_BRANCH\" and .status != \"completed\")] | length" 2>/dev/null || echo 0)
+            [ -z "$CI_BUSY" ] && CI_BUSY=0
+
+            echo "Attempt $((ATTEMPT+1))/$MAX_WAIT — agent-fix in flight: $FIX_BUSY, ci in flight: $CI_BUSY"
+            if [ "$FIX_BUSY" = "0" ] && [ "$CI_BUSY" = "0" ]; then
+              echo "All downstream workflows idle. Proceeding to mergeability check."
+              break
+            fi
+            ATTEMPT=$((ATTEMPT+1))
+            sleep 30
+          done
+
+          if [ $ATTEMPT -ge $MAX_WAIT ]; then
+            echo "Timed out waiting for downstream workflows. Skipping AC verify (will re-trigger on next reviewer comment)."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # ─────────────────────────────────────────────────────────────────
+          # PHASE 3 — Now (and only now) snapshot mergeability
+          # GitHub recomputes mergeStateStatus async after checks complete;
+          # add a small grace sleep so we read the post-check state.
+          # ─────────────────────────────────────────────────────────────────
+          sleep 10
+          STATE=$(gh pr view $PR_NUM --json mergeStateStatus,mergeable -q '.mergeStateStatus + "|" + .mergeable')
+          MERGE_STATE=$(echo "$STATE" | cut -d'|' -f1)
+          MERGEABLE=$(echo "$STATE" | cut -d'|' -f2)
+          echo "Final state: mergeStateStatus=$MERGE_STATE  mergeable=$MERGEABLE"
+
+          # CLEAN     = ready to merge
+          # UNSTABLE  = mergeable but a non-required check failing (still ok)
+          # HAS_HOOKS = passing, waiting on a hook
+          # BLOCKED   = tetap diproses: reviewer bot umumnya submit review
+          #             COMMENTED (tidak pernah APPROVED), jadi GitHub menahan
+          #             PR di state BLOCKED terus-menerus.
+          # DIRTY / BEHIND / DRAFT → skip; komentar reviewer berikutnya akan
+          # memicu ac-verify lagi saat state membaik.
+          # Konflik nyata muncul sebagai mergeable=CONFLICTING, itu tetap di-skip.
+          case "$MERGE_STATE" in
+            CLEAN|UNSTABLE|HAS_HOOKS|BLOCKED)
+              if [ "$MERGEABLE" = "MERGEABLE" ]; then
+                echo "PR is in a verifiable state. Proceeding with AC verify."
+                echo "skip=false" >> $GITHUB_OUTPUT
+              else
+                echo "PR not MERGEABLE ($MERGEABLE). Skipping."
+                echo "skip=true" >> $GITHUB_OUTPUT
+              fi
+              ;;
+            *)
+              echo "mergeStateStatus=$MERGE_STATE — reviewer likely still flagging issues or checks failing. Skipping (will retry on next reviewer comment)."
+              echo "skip=true" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      - name: Extract linked issue number from PR body
+        if: steps.gate.outputs.skip == 'false'
+        id: link
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM=${{ steps.gate.outputs.pr }}
+          BODY=$(gh pr view $PR_NUM --json body -q .body)
+          BRANCH=$(gh pr view $PR_NUM --json headRefName -q .headRefName)
+          # 1) Match "Closes #N", "Fixes #N", "Resolves #N" in body (case-insensitive)
+          ISSUE=$(echo "$BODY" | grep -ioE '(closes|fixes|resolves)[[:space:]]+#[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+          # 2) Fallback: extract issue number from agent branch convention
+          #    `feat/acsm-issue-N` / `fix/acsm-issue-N` / `*/issue-N`
+          if [ -z "$ISSUE" ]; then
+            ISSUE=$(echo "$BRANCH" | grep -oE 'issue-[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+            [ -n "$ISSUE" ] && echo "Issue extracted from branch name: #$ISSUE"
+          fi
+          if [ -z "$ISSUE" ]; then
+            echo "No linked issue found in PR body or branch name. Skipping AC verify."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "Linked issue: #$ISSUE"
+            echo "issue=$ISSUE" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch issue AC + PR diff
+        if: steps.gate.outputs.skip == 'false' && steps.link.outputs.skip == 'false'
+        id: gather
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE=${{ steps.link.outputs.issue }}
+          PR_NUM=${{ steps.gate.outputs.pr }}
+
+          # Issue body (full — usually short)
+          gh issue view $ISSUE --json title,body \
+            --jq '"# Issue #'$ISSUE': " + .title + "\n\n" + .body' > issue.md
+
+          # PR diff — cap at 200KB to stay within model context window
+          gh pr diff $PR_NUM > pr.diff
+          head -c 200000 pr.diff > pr.diff.capped
+          DIFF_SIZE=$(wc -c < pr.diff)
+          CAPPED_SIZE=$(wc -c < pr.diff.capped)
+          if [ "$DIFF_SIZE" -gt "$CAPPED_SIZE" ]; then
+            echo "" >> pr.diff.capped
+            echo "... [diff truncated: $DIFF_SIZE bytes total, showing first $CAPPED_SIZE]" >> pr.diff.capped
+          fi
+
+          echo "Issue body: $(wc -c < issue.md) bytes"
+          echo "PR diff: $CAPPED_SIZE bytes (of $DIFF_SIZE)"
+
+      - name: Build shared prompt
+        if: steps.gate.outputs.skip == 'false' && steps.link.outputs.skip == 'false'
+        run: |
+          cat > system.txt <<'EOF'
+          You are an independent Acceptance Criteria (AC) verifier for a hardware design project
+          written in VHDL, Verilog and SystemVerilog (RTL design, testbenches, constraints, and
+          build/filelist files). A different AI agent wrote the code in the PR diff. Your job is
+          to judge whether each AC item from the linked GitHub issue is actually satisfied by the
+          diff — without bias toward the implementer.
+
+          Find the verifiable checklist in the issue. It may be under any of these section headings:
+            - "Acceptance Criteria"
+            - "Test Plan"
+            - "Acceptance Criteria / Test Plan"
+            - "AC" or "ACs"
+          Use whichever exists. If both exist, merge them and de-duplicate.
+          If neither exists, fall back to extracting any markdown checkboxes (`- [ ]` / `- [x]`) from the issue body.
+
+          For EACH checklist item, output one row in a markdown table with these columns:
+            | # | Criterion | Status | Evidence |
+
+          Status legend (use exactly one):
+            ✅ MET             — clearly satisfied, evidence in diff
+            ⚠️ PARTIAL          — partially satisfied (e.g. 4 of 5 required states, wrong port width, missing one mode)
+            ❌ NOT MET          — missing or incorrect
+            ❓ CANNOT VERIFY    — diff doesn't contain enough info to judge (e.g. needs simulation, synthesis, or timing run)
+
+          Evidence must cite file path + line number(s) from the diff (e.g. `rtl/fifo_ctrl.sv:42-58`) or say
+          "not found in diff". Be terse — one sentence per cell.
+
+          After the table, add a one-line **Summary**: counts per status + overall recommendation
+          (READY TO MERGE / NEEDS FIX / NEEDS HUMAN REVIEW).
+
+          Be strict but fair. If an AC says "signal fifo_full" but the code names it "full_o",
+          flag PARTIAL with a note — naming choice may be intentional but deviates from spec.
+          Do NOT invent evidence. If you can't find it in the diff, say so.
+
+          Important: you cannot run simulation, lint, synthesis, or timing analysis. For AC items
+          like "testbench passes", "lint clean", "meets timing at 100 MHz", or "resource usage under X",
+          answer "❓ CANNOT VERIFY" unless the PR body quotes actual tool output. Judge whether the
+          testbench EXISTS and is plausibly self-checking from the diff — but never claim a simulation
+          passed or timing closed when no run is evidenced.
+
+          ADDITIONAL IMPLICIT CHECKS (flag in Summary section even if not in explicit AC):
+          Beyond the explicit acceptance criteria, also scan the diff for these common hardware
+          gap patterns. List them as **⚠️ IMPLICIT GAPS** in the Summary line — these are not
+          blocking but warn the human reviewer.
+
+            1. **New RTL file not registered in the build**: if the diff adds a .v / .sv / .vhd
+               file, check whether a filelist (*.f), Makefile, FuseSoC .core, or vendor project
+               file in the repo was updated to include it. An unreferenced module never gets
+               built and the gap surfaces much later. Flag if missing.
+
+            2. **Inferred latch**: an always_comb / always @(*) / VHDL combinational process where
+               some output is not assigned on every path (incomplete if without else, case without
+               default, or no default assignment at the top of the block). Flag the signal by name.
+
+            3. **Clock domain crossing without a synchronizer**: a signal assigned in one clock
+               domain and sampled in another with no 2-flop synchronizer, handshake, or async FIFO
+               in the diff. Flag the crossing signal.
+
+            4. **Reset gaps**: sequential state added without reset handling, or a reset style
+               (sync vs async, active-low vs active-high) that contradicts the surrounding module.
+               Flag the register.
+
+            5. **New module without a self-checking testbench**: a new RTL module where the diff
+               adds no testbench, or adds one that only dumps waveforms with no assertions and no
+               expected-value comparison. Flag it.
+
+            6. **Assignment-type mismatch**: non-blocking (<=) used in a combinational block, or
+               blocking (=) used in a clocked block. Flag the block.
+
+            7. **Width mismatch / implicit truncation**: assignment, port connection, or arithmetic
+               where operand widths differ without an explicit cast or resize. Flag the expression.
+
+            8. **Non-synthesizable constructs in RTL**: delays (#), initial blocks, $display,
+               $finish, real types, or fork/join inside a synthesizable module (as opposed to a
+               testbench). Flag the construct.
+
+          PROJECT-WIDE HDL CONVENTIONS (apply unless CLAUDE.md in the repo says otherwise —
+          CLAUDE.md always wins if it exists and contradicts this list):
+            - SystemVerilog RTL should use always_ff / always_comb / always_latch, not bare `always`.
+            - VHDL should use ieee.numeric_std; std_logic_arith / std_logic_unsigned are legacy —
+              flag PARTIAL if new code uses them.
+            - Ports use std_logic / std_logic_vector in VHDL; logic in SystemVerilog.
+            - Functional behaviour (correct FSM states, correct handshake, correct widths) takes
+              priority over style nitpicks. Do not mark NOT MET purely on naming or formatting.
+            - Vendor-specific primitives in portable RTL should be flagged PARTIAL unless the
+              issue explicitly asks for that vendor's technology.
+
+          Output ONLY the markdown report. No preamble, no explanation outside the table.
+          EOF
+
+          {
+            echo "## Linked Issue"
+            cat issue.md
+            echo ""
+            echo "## PR Diff"
+            echo '```diff'
+            cat pr.diff.capped
+            echo '```'
+          } > user.txt
+
+          echo "Prompt size: sys=$(wc -c < system.txt)  usr=$(wc -c < user.txt)"
+
+      # ─────────────────────────────────────────────────────────────────
+      # AC checker: 'agent-verify' (OpenAI Chat Completions protocol).
+      # Model family berbeda dari agent yang menulis kode — menghindari
+      # bias same-vendor. Reasoning model → max_tokens besar (24000).
+      # ─────────────────────────────────────────────────────────────────
+      - name: Call AC reviewer
+        id: agent-verify
+        if: steps.gate.outputs.skip == 'false' && steps.link.outputs.skip == 'false'
+        env:
+          AC_VERIFY_API_KEY: ${{ secrets.AC_VERIFY_API_KEY }}
+        run: |
+          # OpenAI Chat Completions payload. stream:false eksplisit — sebagian
+          # model default ke SSE streaming yang tidak bisa di-parse jq.
+          jq -n --rawfile sys system.txt --rawfile usr user.txt \
+            '{model:"agent-verify", messages:[{role:"system",content:$sys},{role:"user",content:$usr}], max_tokens:24000, temperature:0.2, stream:false}' > payload.json
+
+          HTTP=$(curl -sS -o response.json -w "%{http_code}" \
+            -X POST "https://rhkb7em.abc-tunnel.us/v1/chat/completions" \
+            -H "Authorization: Bearer $AC_VERIFY_API_KEY" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            --data @payload.json)
+          echo "AC reviewer HTTP=$HTTP"
+
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::AC reviewer failed (HTTP $HTTP)."
+            cat response.json
+            exit 1
+          fi
+
+          # Defensive parse — log first 500 chars on parse failure to diagnose
+          # unexpected response shapes (SSE streaming, plaintext, error JSON).
+          if ! jq empty response.json 2>/dev/null; then
+            echo "::error::Response is not valid JSON. First 500 chars of response:"
+            head -c 500 response.json
+            echo ""
+            echo "::error::If response starts with 'data:' or 'event:', model returned SSE format."
+            echo "::error::Add stream:false to payload + Accept: application/json header to force non-SSE."
+            exit 1
+          fi
+
+          FINISH=$(jq -r '.choices[0].finish_reason // "?"' response.json)
+          jq -r '.choices[0].message.content // ""' response.json > ac-report.md
+
+          if [ ! -s ac-report.md ]; then
+            echo "::error::AC reviewer returned empty content (finish=$FINISH)."
+            cat response.json
+            exit 1
+          fi
+
+          if [ "$FINISH" = "length" ]; then
+            echo "" >> ac-report.md
+            echo "---" >> ac-report.md
+            echo "⚠️ **Note**: Response truncated at \`max_tokens\`. Report may be incomplete." >> ac-report.md
+          fi
+
+          echo "ok=true" >> $GITHUB_OUTPUT
+          echo "model=agent-verify" >> $GITHUB_OUTPUT
+          echo "vendor=verify" >> $GITHUB_OUTPUT
+
+      # ─────────────────────────────────────────────────────────────────
+      # POST / UPDATE PR COMMENT — annotates which model was used
+      # ─────────────────────────────────────────────────────────────────
+      - name: Post / update PR comment
+        if: steps.gate.outputs.skip == 'false' && steps.link.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM=${{ steps.gate.outputs.pr }}
+          ISSUE=${{ steps.link.outputs.issue }}
+          MARKER="<!-- ac-verify -->"
+
+          MODEL="${{ steps.agent-verify.outputs.model }}"
+          VENDOR="${{ steps.agent-verify.outputs.vendor }}"
+
+          {
+            echo "$MARKER"
+            echo "## 🎯 AC Verification (Issue #$ISSUE) — by $MODEL"
+            echo "_Independent second-opinion check. Kode ditulis oleh model agent-coding; AC dinilai oleh $MODEL lewat $VENDOR untuk menghindari bias same-vendor._"
+            echo ""
+            cat ac-report.md
+            echo ""
+            echo "---"
+            echo "<sub>Generated by \`ac-verify.yml\` · commit \`${{ github.event.pull_request.head.sha }}\` · [run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})</sub>"
+          } > comment.md
+
+          # Find existing AC-verify comment by marker and update; else create new.
+          # MARKER lewat jq --arg supaya karakter khusus (`<`, `!`, `-`, `>`, spasi)
+          # tidak kena interpolasi shell.
+          EXISTING=$(gh api "repos/${{ github.repository }}/issues/$PR_NUM/comments" --paginate \
+            | jq -r --arg m "$MARKER" '.[] | select(.body | startswith($m)) | .id' \
+            | head -1)
+
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing comment $EXISTING"
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$EXISTING" \
+              -f body="$(cat comment.md)" >/dev/null
+          else
+            echo "Creating new comment"
+            gh pr comment $PR_NUM --body-file comment.md
+          fi
+
+      # ─────────────────────────────────────────────────────────────────
+      # AUTO-LOOP: If AC report has PARTIAL or NOT MET findings,
+      # automatically trigger agent-fix with the findings.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Auto-trigger agent-fix on AC failures
+        if: steps.gate.outputs.skip == 'false' && steps.link.outputs.skip == 'false' && steps.agent-verify.outputs.ok == 'true'
+        id: auto_fix
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM=${{ steps.gate.outputs.pr }}
+
+          # Count PARTIAL and NOT MET items in the report
+          PARTIAL=$(grep -cE '⚠️ PARTIAL' ac-report.md || true)
+          NOT_MET=$(grep -cE '❌ NOT MET' ac-report.md || true)
+          TOTAL=$((PARTIAL + NOT_MET))
+
+          echo "AC findings: PARTIAL=$PARTIAL  NOT_MET=$NOT_MET  total=$TOTAL"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "All AC items MET or CANNOT VERIFY. No auto-fix needed."
+            echo "triggered=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Found $TOTAL unmet AC items. Auto-triggering agent-fix."
+
+          # Extract the failing items for the directive
+          FAILING=$(grep -E '⚠️ PARTIAL|❌ NOT MET' ac-report.md || echo "(could not extract)")
+
+          # Build a compact directive with the AC findings
+          {
+            echo "/agent-fix"
+            echo ""
+            echo "## AC Verify Findings — Auto-triggered Fix Request"
+            echo ""
+            echo "AC verification (agent-verify) found **$TOTAL issue(s)** that need fixing:"
+            echo ""
+            echo "$FAILING"
+            echo ""
+            echo "Please address the PARTIAL and NOT MET items above. Refer to the full AC report comment on this PR for details."
+          } > fix-directive.md
+
+          gh pr comment $PR_NUM --body-file fix-directive.md
+          echo "triggered=true" >> $GITHUB_OUTPUT
