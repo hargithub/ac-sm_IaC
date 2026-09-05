@@ -112,9 +112,12 @@ module tb_uart_tx;
                 #1;
                 t++;
             end
-            // Bila batas waktu tercapai, check_bit di atas sudah menaikkan errors;
-            // di sini tidak menaikkan errors lagi supaya satu kegagalan = satu hitungan.
-            if (t >= BITS*DIV + 4)
+            // Bila batas waktu tercapai DAN tx_busy masih tinggi, laporkan sebagai
+            // diagnosa. Guard tx_busy: bila busy turun tepat di iterasi terakhir,
+            // frame sebenarnya selesai dan semua pemeriksaan lolos. $error di sini
+            // tidak menaikkan errors; check_bit tx_busy di bawah yang mencatat
+            // kegagalan, sehingga satu kegagalan = satu hitungan.
+            if ((t >= BITS*DIV + 4) && tx_busy)
                 $error("tx_busy masih tinggi setelah %0d clock (watchdog timeout)", t);
 
             // Periksa frame: start 0, delapan bit data LSB lebih dulu, stop 1.
