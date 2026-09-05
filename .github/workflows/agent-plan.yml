@@ -273,19 +273,42 @@ jobs:
                 "$RAW_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -20 || true
             fi
 
-            if [ $CLAUDE_EXIT -eq 124 ]; then
-              echo "::warning::Agent menggantung dan dihentikan paksa setelah ${AGENT_TIMEOUT}s. Tanpa pembungkus timeout ini, job akan diam sampai batas job dan loop retry tidak pernah terpakai."
+            # --- Diagnosa penyebab sebenarnya, dibaca dari stream ---------------
+            # Menggantikan tebakan "likely rate limit" warisan LPMS-3, yang keliru:
+            # kegagalan nyata pada run 33959501522 ternyata Cloudflare 524, bukan
+            # rate limit. Blok ini hanya membaca dan mencetak; tidak mengubah status.
+            API_STATUS=""; API_MSG=""; API_TURNS=""
+            if [ -s "$RAW_LOG" ]; then
+              API_STATUS=$(jq -Rr 'fromjson? | select(.type=="result") | .api_error_status // empty' "$RAW_LOG" 2>/dev/null | tail -1 || true)
+              API_MSG=$(jq -Rr 'fromjson? | select(.type=="result") | .result // empty' "$RAW_LOG" 2>/dev/null | tail -1 | head -c 220 || true)
+              API_TURNS=$(jq -Rr 'fromjson? | select(.type=="result") | .num_turns // empty' "$RAW_LOG" 2>/dev/null | tail -1 || true)
             fi
+            if [ "$$CLAUDE_EXIT" = "124" ]; then
+              DIAG="agent MENGGANTUNG, dipotong paksa setelah ${AGENT_TIMEOUT}s"
+            else
+              case "$API_STATUS" in
+                524)     DIAG="GATEWAY TIMEOUT 524 - respons model melampaui batas baca proxy Cloudflare (120 dtk). Ini BUKAN rate limit. Perbaikannya di sisi gateway: teruskan streaming SSE apa adanya, atau lewati Cloudflare untuk endpoint ini." ;;
+                429)     DIAG="RATE LIMIT 429 dari gateway" ;;
+                401|403) DIAG="KREDENSIAL DITOLAK ($API_STATUS) - periksa secret API key workflow ini" ;;
+                400)     DIAG="PERMINTAAN DITOLAK 400 - sering berarti nama model tidak dikenali gateway" ;;
+                5??)     DIAG="GATEWAY ERROR $API_STATUS" ;;
+                "")      DIAG="tidak ada status API di stream; exit code $$CLAUDE_EXIT" ;;
+                *)       DIAG="status API $API_STATUS" ;;
+              esac
+            fi
+            echo "Diagnosa: $DIAG"
+            if [ -n "$API_TURNS" ]; then echo "  giliran terpakai: $API_TURNS"; fi
+            if [ -n "$API_MSG" ]; then echo "  pesan: $API_MSG"; fi
 
             if [ $CLAUDE_EXIT -ne 0 ]; then
               RETRY=$((RETRY+1))
               if [ $RETRY -lt $MAX_RETRIES ]; then
                 BACKOFF=$((60 * RETRY))
-                echo "Agent gagal dengan kode $CLAUDE_EXIT. Mengulang dalam ${BACKOFF}s..."
+                echo "Gagal: $DIAG. Mengulang dalam ${BACKOFF}s..."
                 sleep $BACKOFF
                 continue
               else
-                echo "Agent gagal setelah $MAX_RETRIES percobaan"
+                echo "::error::Gagal setelah $MAX_RETRIES percobaan. Penyebab terakhir: $DIAG"
                 exit 1
               fi
             fi

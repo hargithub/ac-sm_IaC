@@ -158,6 +158,36 @@ dan push bertahap sehingga branch-nya sendiri menjadi checkpoint alami.
 
 ---
 
+## Kendala gateway yang diketahui: Cloudflare 524
+
+Gateway berada di belakang Cloudflare dengan **batas baca proxy 120 detik**.
+Bila satu respons model melampaui itu, koneksi diputus dan agent menerima
+`API Error: 524`. Terbukti pada run `33959501522`: percobaan pertama sempat
+membaca, mengedit, dan menulis berkas, lalu tumbang di giliran ke-30 dengan
+`api_error_status: 524`; dua percobaan berikutnya menggantung sampai dipotong
+`timeout`.
+
+Preflight tetap melaporkan `HTTP 200` karena permintaannya `max_tokens: 1` dan
+selesai dalam milidetik — jauh di bawah 120 detik. Preflight memang tidak
+dirancang mendeteksi batas durasi, hanya keterjangkauan dan kredensial.
+
+Perbaikannya ada di sisi gateway, bukan workflow:
+
+1. **Teruskan streaming SSE apa adanya.** Bila gateway mem-buffer respons model
+   lalu mengirimnya sekaligus, Cloudflare melihat 120 detik tanpa satu byte pun
+   lalu memutus. Bila byte mengalir terus, timer proxy tidak pernah tercapai.
+   Ini perbaikan baku untuk 524 pada gateway LLM.
+2. **Lewati Cloudflare** untuk endpoint ini, atau naikkan Proxy Read Timeout —
+   hanya tersedia di plan Enterprise.
+3. **Pakai model yang lebih cepat** untuk `CODE_MODEL`, sehingga respons per
+   giliran lebih pendek. Mengurangi peluang, tidak menghilangkan risiko.
+
+Sejak run itu, pesan kegagalan membaca `api_error_status` dari stream dan
+menyebut penyebabnya secara spesifik, menggantikan tebakan "likely rate limit"
+yang terbawa dari LPMS-3 dan ternyata keliru.
+
+---
+
 ## Prasyarat 1 — Secrets
 
 Set di **Settings → Secrets and variables → Actions**. Nilainya sama dengan yang
