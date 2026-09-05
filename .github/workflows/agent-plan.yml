@@ -82,10 +82,10 @@ jobs:
           #   vars.PLAN_MODEL     - nama model perencana   (default: agent-planning)
           #   vars.PLAN_BASE_URL  - endpoint gateway       (default: gateway yang sama)
           #   secrets.PLAN_API_KEY - token khusus perencana (default: AGENT_API_KEY)
-          ANTHROPIC_BASE_URL: ${{ vars.PLAN_BASE_URL || 'https://rhkb7em.abc-tunnel.us/v1' }}
-          ANTHROPIC_AUTH_TOKEN: ${{ secrets.PLAN_API_KEY || secrets.AGENT_API_KEY }}
-          ANTHROPIC_MODEL: ${{ vars.PLAN_MODEL || 'agent-planning' }}
-          ANTHROPIC_SMALL_FAST_MODEL: ${{ vars.PLAN_MODEL || 'agent-planning' }}
+          ANTHROPIC_BASE_URL: ${{ vars.PLAN_BASE_URL }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.PLAN_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.PLAN_MODEL }}
+          ANTHROPIC_SMALL_FAST_MODEL: ${{ vars.PLAN_MODEL }}
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
