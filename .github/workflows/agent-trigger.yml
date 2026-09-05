@@ -111,10 +111,20 @@ jobs:
       # dicoba di sini, jadi 401/404 tidak boleh memblokir alur yang sebenarnya jalan.
       - name: Preflight gateway model
         env:
-          PF_BASE_URL: ${{ vars.CODE_BASE_URL || 'https://rhkb7em.abc-tunnel.us/v1' }}
-          PF_TOKEN: ${{ secrets.CODE_API_KEY || secrets.AGENT_API_KEY }}
-          PF_MODEL: ${{ vars.CODE_MODEL || 'agent-coding' }}
+          PF_BASE_URL: ${{ vars.CODE_BASE_URL }}
+          PF_TOKEN: ${{ secrets.CODE_API_KEY }}
+          PF_MODEL: ${{ vars.CODE_MODEL }}
         run: |
+          # Tanpa fallback, variable atau secret yang kosong akan mengirim nama model
+          # kosong ke gateway dan gagal dengan pesan yang membingungkan. Tangkap di sini.
+          MISSING=""
+          [ -z "$PF_BASE_URL" ] && MISSING="$MISSING BASE_URL"
+          [ -z "$PF_TOKEN" ]    && MISSING="$MISSING API_KEY"
+          [ -z "$PF_MODEL" ]    && MISSING="$MISSING MODEL"
+          if [ -n "$MISSING" ]; then
+            echo "::error::Konfigurasi belum lengkap, kosong:$MISSING. Set repository variable atau secret yang sesuai."
+            exit 1
+          fi
           echo "Gateway : $PF_BASE_URL"
           echo "Model   : $PF_MODEL"
           set +e

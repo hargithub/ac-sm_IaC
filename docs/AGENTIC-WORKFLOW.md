@@ -85,15 +85,19 @@ otomatis dan diulang.
 Model diatur lewat **repository variables**, jadi bisa diganti tanpa menyunting
 workflow. Semua punya nilai default, aman dikosongkan.
 
-| Variable | Dipakai | Default |
-|---|---|---|
-| `PLAN_MODEL` | agent-plan | `agent-planning` |
-| `PLAN_BASE_URL` | agent-plan | gateway yang sama |
-| `CODE_MODEL` | agent-trigger | `agent-coding` |
-| `CODE_BASE_URL` | agent-trigger | gateway yang sama |
+Tidak ada nilai default di workflow — semuanya **wajib** diisi. Nilai kosong
+sengaja dibuat gagal cepat di preflight daripada diam-diam tertutup fallback.
 
-Secret opsional `PLAN_API_KEY` dan `CODE_API_KEY` dipakai bila kedua tahap
-memakai penyedia berbeda; bila kosong, keduanya jatuh ke `AGENT_API_KEY`.
+| Variable | Dipakai | Nilai saat ini |
+|---|---|---|
+| `PLAN_MODEL` | agent-plan | `thinker-model` |
+| `PLAN_BASE_URL` | agent-plan | gateway |
+| `CODE_MODEL` | agent-trigger, agent-fix | `agent-coding` |
+| `CODE_FAST_MODEL` | agent-fix, sebagai `ANTHROPIC_SMALL_FAST_MODEL` | `coding-simple` |
+| `CODE_BASE_URL` | agent-trigger, agent-fix | gateway |
+
+Secret: `PLAN_API_KEY` untuk agent-plan, `CODE_API_KEY` untuk agent-trigger,
+`AGENT_API_KEY` untuk agent-fix.
 
 Contoh mengarahkan perencana ke model kuat dan pelaksana ke model murah:
 
@@ -133,8 +137,12 @@ exit 124 sehingga retry benar-benar berfungsi.
 `set -o pipefail` dipasang agar status `claude` yang menentukan, bukan status
 `tee` yang selalu nol.
 
-**Preflight gateway.** Sebelum agent dijalankan, satu permintaan `max_tokens: 1`
-dikirim ke gateway. Kegagalan tingkat koneksi — DNS mati, koneksi ditolak —
+**Preflight gateway.** Sebelum agent dijalankan, konfigurasi diperiksa lalu satu
+permintaan `max_tokens: 1` dikirim ke gateway. Karena tidak ada nilai fallback,
+variable atau secret yang kosong akan mengirim nama model kosong dan gagal dengan
+pesan membingungkan — preflight menangkapnya lebih dulu dan menyebut persis mana
+yang belum diisi. Nilai yang diuji preflight selalu sama persis dengan yang dipakai
+step agent, supaya hasilnya bermakna. Kegagalan tingkat koneksi — DNS mati, koneksi ditolak —
 menghentikan job dalam hitungan detik, bukan menit. Kode HTTP hanya menjadi
 peringatan: bentuk path yang dipakai CLI bisa berbeda dari yang dicoba preflight,
 jadi 401 atau 404 sengaja tidak memblokir alur yang sebenarnya berjalan. HTTP 400
