@@ -146,9 +146,15 @@ Tanpa akhiran arah (`_i` / `_o`) — arah sudah jelas dari deklarasi port.
 
 ## 7. Alur kerja agentic
 
-Repo ini memakai loop agent GitHub Actions: issue berlabel `agent-task` memicu
-tahap rencana, label `plan-approved` memicu implementasi, lalu review otomatis
-dan verifikasi acceptance criteria berjalan di PR.
+Repo ini memakai loop agent GitHub Actions. Perencanaan dan pelaksanaan
+dijalankan oleh dua workflow terpisah dengan model berbeda:
+
+- `agent-plan.yml` — dipicu label `agent-task`, memakai model kuat, menghasilkan
+  rencana rinci lalu memasang label `plan-posted`
+- `agent-trigger.yml` — dipicu label `plan-approved`, memakai model murah, hanya
+  menerjemahkan rencana menjadi kode
+
+Setelah PR terbuka, review otomatis dan verifikasi acceptance criteria berjalan.
 
 Selengkapnya di [docs/AGENTIC-WORKFLOW.md](docs/AGENTIC-WORKFLOW.md).
 

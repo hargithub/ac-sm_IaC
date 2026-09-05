@@ -12,7 +12,7 @@ ikut di-port — ditambahkan nanti setelah struktur repo ini terbentuk.
 ## Alur
 
 ```
-   Issue dibuat (template) ──label: agent-task──►  agent-trigger.yml  (tahap PLAN)
+   Issue dibuat (template) ──label: agent-task──►  agent-plan.yml  (MODEL KUAT)
                                                           │
                                           agent post komentar <!-- agent-plan -->
                                           + label 'plan-posted'
@@ -23,7 +23,7 @@ ikut di-port — ditambahkan nanti setelah struktur repo ini terbentuk.
               label: plan-approved                                    ulangi plan)
                              │
                              ▼
-                  agent-trigger.yml  (tahap IMPLEMENT)
+                  agent-trigger.yml  (MODEL MURAH)
                   branch feat/acsm-issue-N → lint/elaborate → PR
                              │
                              ▼
@@ -57,13 +57,53 @@ agent langsung implement.
 
 | File | Trigger | Fungsi |
 |------|---------|--------|
-| `agent-trigger.yml` | label `agent-task` / `plan-approved` / `fast-track`, atau `workflow_dispatch` | Tahap PLAN (post rencana) dan IMPLEMENT (branch + PR) |
+| `agent-plan.yml` | label `agent-task`, atau `workflow_dispatch` | Tahap PLAN: menyusun rencana rinci, memposting `<!-- agent-plan -->`, memasang `plan-posted` |
+| `agent-trigger.yml` | label `plan-approved` / `fast-track`, atau `workflow_dispatch` | Tahap IMPLEMENT: branch, lint, simulasi, PR |
 | `agent-fix.yml` | komentar `/agent-fix`, atau review dari bot reviewer | Perbaiki temuan reviewer & ac-verify, balas tiap thread |
 | `ac-verify.yml` | review/komentar bot reviewer, atau `workflow_dispatch` | Cek acceptance criteria secara independen, auto-trigger agent-fix bila ada yang belum terpenuhi |
 | `ocr-review.yml` | PR opened/reopened, komentar `/open-code-review` | Review kode oleh OpenCodeReview (LLM Quality Gate terpisah) |
 | `ocr-rebuttal.yml` | balasan berisi `🤔 Rebuttal` | OCR menjawab rebuttal agent di thread yang sama |
 
 Template issue: `.github/ISSUE_TEMPLATE/acsm-feature.yml` (otomatis memberi label `agent-task`).
+
+---
+
+## Pemisahan model perencana dan pelaksana
+
+Perencanaan dan pelaksanaan sengaja dipisah ke dua workflow agar keduanya bisa
+memakai model berbeda. Perencanaan menuntut kemampuan arsitektur yang kuat tapi
+jarang dijalankan; pelaksanaan dijalankan lebih sering dan hanya menerjemahkan
+rencana yang sudah rinci menjadi kode, sehingga model murah sudah memadai.
+
+Konsekuensinya mengikat: **rencana harus cukup rinci sehingga pelaksana tidak
+perlu mengambil satu pun keputusan desain.** Prompt di `agent-plan.yml`
+mewajibkan sebelas bagian, termasuk deklarasi modul yang bisa disalin apa
+adanya, nilai localparam yang sudah terhitung, tabel FSM lengkap, dan skenario
+uji bernomor dengan nilai konkret. Rencana di bawah 1.500 karakter ditolak
+otomatis dan diulang.
+
+Model diatur lewat **repository variables**, jadi bisa diganti tanpa menyunting
+workflow. Semua punya nilai default, aman dikosongkan.
+
+| Variable | Dipakai | Default |
+|---|---|---|
+| `PLAN_MODEL` | agent-plan | `agent-planning` |
+| `PLAN_BASE_URL` | agent-plan | gateway yang sama |
+| `CODE_MODEL` | agent-trigger | `agent-coding` |
+| `CODE_BASE_URL` | agent-trigger | gateway yang sama |
+
+Secret opsional `PLAN_API_KEY` dan `CODE_API_KEY` dipakai bila kedua tahap
+memakai penyedia berbeda; bila kosong, keduanya jatuh ke `AGENT_API_KEY`.
+
+Contoh mengarahkan perencana ke model kuat dan pelaksana ke model murah:
+
+```bash
+gh variable set PLAN_MODEL --repo hargithub/ac-sm_IaC --body "nama-model-kuat"
+gh variable set CODE_MODEL --repo hargithub/ac-sm_IaC --body "nama-model-murah"
+```
+
+Satu catatan operasional: `agent-plan.yml` tidak memasang toolchain HDL karena
+tahap rencana tidak mengompilasi apa pun — menghemat sekitar 40 detik per run.
 
 ---
 

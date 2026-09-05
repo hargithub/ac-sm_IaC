@@ -1,0 +1,301 @@
+name: Agent Plan
+
+# Tahap PERENCANAAN, terpisah dari eksekusi.
+#
+# Pemisahan ini disengaja agar dua tahap memakai model berbeda:
+#   - agent-plan.yml     : model kuat untuk arsitektur dan perencanaan (mahal, jarang jalan)
+#   - agent-trigger.yml  : model murah untuk menerjemahkan rencana jadi kode
+#
+# Konsekuensinya rencana yang dihasilkan HARUS sangat rinci. Pelaksana
+# diasumsikan berkemampuan terbatas dan tidak boleh perlu mengambil satu pun
+# keputusan desain baru — semuanya sudah diputuskan di sini.
+#
+# Alur: label 'agent-task' -> rencana diposting -> label 'plan-posted'
+#       lalu manusia me-review dan memberi label 'plan-approved'
+#       yang memicu agent-trigger.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Nomor issue yang akan direncanakan'
+        required: true
+        type: string
+  issues:
+    types: [labeled]
+
+jobs:
+  plan:
+    # concurrency di LEVEL JOB, bukan workflow. GitHub tidak menyediakan filter
+    # nama label pada trigger `issues: [labeled]`, jadi SETIAP penambahan label
+    # membuat catatan run. Di level job, run yang `if`-nya false di-skip tanpa
+    # pernah menyentuh antrean sehingga tidak bisa membatalkan run yang sah.
+    concurrency:
+      group: agent-plan-${{ github.event.issue.number || github.event.inputs.issue_number }}
+      cancel-in-progress: false
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'agent-task'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code
+        run: npm i -g @anthropic-ai/claude-code
+
+      - name: Determine Issue Number
+        id: issue
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "number=${{ github.event.inputs.issue_number }}" >> $GITHUB_OUTPUT
+          else
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          fi
+
+      # Tahap rencana tidak mengompilasi apa pun, jadi toolchain HDL sengaja
+      # TIDAK dipasang di sini. Menghemat sekitar 40 detik tiap run.
+
+      - name: Stagger Start (hindari rate limit)
+        run: |
+          WAIT=$((RANDOM % 60))
+          echo "Menunggu ${WAIT}s untuk menyebar panggilan API..."
+          sleep $WAIT
+
+      - name: Jalankan Agent Perencana
+        id: plan
+        env:
+          # Model perencana. Diatur lewat repository variables supaya bisa diganti
+          # tanpa menyunting workflow:
+          #   vars.PLAN_MODEL     - nama model perencana   (default: agent-planning)
+          #   vars.PLAN_BASE_URL  - endpoint gateway       (default: gateway yang sama)
+          #   secrets.PLAN_API_KEY - token khusus perencana (default: AGENT_API_KEY)
+          ANTHROPIC_BASE_URL: ${{ vars.PLAN_BASE_URL || 'https://rhkb7em.abc-tunnel.us/v1' }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.PLAN_API_KEY || secrets.AGENT_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.PLAN_MODEL || 'agent-planning' }}
+          ANTHROPIC_SMALL_FAST_MODEL: ${{ vars.PLAN_MODEL || 'agent-planning' }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          MAX_RETRIES=3
+          RETRY=0
+
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            echo "=== Percobaan $((RETRY+1)) dari $MAX_RETRIES (tahap PLAN) ==="
+
+            if claude -p "Baca GitHub issue #${{ steps.issue.outputs.number }} dengan 'gh issue view ${{ steps.issue.outputs.number }}'.
+
+          Kamu berada di mode PERENCANAAN. JANGAN menulis kode, JANGAN membuat branch, JANGAN membuka PR.
+
+          ## Konteks
+
+          Repo ini proyek desain hardware untuk FPGA Xilinx Artix-7. Desain memakai
+          Verilog-2001, testbench memakai SystemVerilog prosedural. Baca lebih dulu:
+            - CLAUDE.md               aturan yang mengikat, menang atas kebiasaanmu
+            - rtl/counter.v           pola rujukan RTL
+            - tb/tb_counter.sv        pola rujukan testbench
+            - Makefile                perintah lint dan simulasi
+            - rtl/files.f, tb/files.f filelist yang wajib diperbarui
+          Baca juga modul lain yang relevan dengan issue ini.
+
+          ## Siapa pembaca rencanamu
+
+          Rencana ini akan dieksekusi oleh agen lain yang memakai model JAUH LEBIH
+          LEMAH darimu. Agen itu tidak boleh perlu mengambil satu pun keputusan
+          desain. Setiap pilihan — nama sinyal, lebar bit, jumlah state, nilai
+          konstanta, urutan operasi — harus SUDAH kamu putuskan dan tulis eksplisit.
+          Kalau ada bagian yang membuat pelaksana harus menebak, rencanamu belum selesai.
+
+          ## Aturan yang paling sering dilanggar — baca dua kali
+
+          SALIN NAMA PERSIS DARI ACCEPTANCE CRITERIA. Bila AC menyebut port bernama
+          'tx_start', tulis 'tx_start', bukan 'tx_en'. Bila AC menyebut parameter
+          'BAUD', jangan menulis 'BAUD_RATE'. Bila AC menyebut empat state, jangan
+          memecahnya jadi sebelas. Penggantian nama sepele akan dinilai GAGAL oleh
+          workflow verifikasi acceptance criteria dan memicu siklus perbaikan yang mahal.
+
+          Sebelum menulis rencana, salin dulu setiap butir checklist dari AC, lalu
+          pastikan setiap nama yang kamu pakai cocok huruf per huruf.
+
+          ## Struktur rencana yang WAJIB diikuti
+
+          Tulis dalam Bahasa Indonesia, dengan bagian-bagian berikut secara berurutan:
+
+          1. **Peta Acceptance Criteria** — tabel dua kolom: setiap butir AC dari issue,
+             dan bagian rencana mana yang memenuhinya. Tidak boleh ada butir yang kosong.
+
+          2. **Berkas yang disentuh** — path lengkap, ditandai baru atau ubah, disertai
+             ringkasan satu kalimat apa yang berubah di masing-masing. Termasuk
+             rtl/files.f dan tb/files.f bila ada berkas baru.
+
+          3. **Deklarasi modul lengkap** — tulis blok kode Verilog berisi header modul
+             utuh: parameter beserta nilai default, dan seluruh port beserta arah,
+             lebar bit, dan komentar singkat. Pelaksana harus bisa menyalinnya apa adanya.
+
+          4. **Parameter dan localparam** — daftar lengkap beserta NILAI TERHITUNG,
+             bukan sekadar rumus. Contoh: tulis 'DIV = 868' dan cara memperolehnya,
+             bukan cuma 'DIV = CLK_HZ / BAUD'. Sebutkan juga lebar bit tiap counter
+             dan cara menghitungnya.
+
+          5. **FSM** — bila ada, sajikan tabel dengan kolom: state, keluaran tiap sinyal
+             pada state itu, state tujuan, dan syarat transisi. Sebutkan tegas bahwa
+             'case' wajib punya cabang 'default' dan ke mana default itu mengarah.
+             Bila tidak ada FSM, tulis 'Tidak ada FSM' dan jelaskan struktur logikanya.
+
+          6. **Urutan waktu** — bila perilakunya bergantung waktu, jelaskan berapa siklus
+             tiap fase berlangsung dan apa yang terjadi di setiap batas siklus.
+
+          7. **Rencana verifikasi** — daftar skenario BERNOMOR. Tiap skenario menyebut:
+             stimulus yang diberikan, nilai yang diharapkan, dan cara memeriksanya.
+             Sebutkan nilai uji konkret, bukan 'beberapa nilai'. Bila AC meminta nilai
+             tertentu, nilai itu wajib muncul di sini. Sebutkan juga override parameter
+             yang dipakai testbench agar simulasi cepat, lengkap dengan angkanya.
+
+          8. **Perintah verifikasi** — tulis perintah persis yang harus dijalankan
+             pelaksana sebelum membuat PR, misalnya 'make lint TOP=nama' dan
+             'make sim TB=tb_nama'.
+
+          9. **Jebakan yang harus dihindari** — kutip aturan CLAUDE.md yang relevan
+             dengan issue ini secara spesifik, bukan menyalin seluruh daftarnya.
+             Sebutkan kesalahan konkret yang paling mungkin terjadi pada tugas ini.
+
+          10. **Risiko dan dependensi** — termasuk perkiraan pemakaian resource pada Artix-7.
+
+          11. **Estimasi cakupan** — small, medium, atau large, beserta perkiraan
+              jumlah berkas dan baris.
+
+          ## Batasan teknis yang mengikat
+
+          - Reset SINKRON ACTIVE-HIGH bernama 'rst'
+          - Sekuensial pakai non-blocking, kombinasional pakai blocking
+          - Setiap 'case' wajib punya 'default'
+          - Jangan pakai primitif vendor: BUFG, MMCM, PLL, IDDR, ISERDES
+          - Jangan pakai konstruksi non-sintesis di RTL: delay, initial, \$display, \$finish
+          - Testbench dilarang memakai class, randomize, covergroup, atau SVA konkuren —
+            Icarus Verilog 12 tidak mendukungnya. Queue, dynamic array, dan interface boleh.
+          - Lebar bit ditangani eksplisit, tanpa truncation atau extension implisit
+
+          ## Cara memposting
+
+          Posting rencana sebagai komentar pada issue #${{ steps.issue.outputs.number }}:
+            gh issue comment ${{ steps.issue.outputs.number }} --body '<rencana>'
+
+          Badan komentar WAJIB diawali baris penanda persis:
+            <!-- agent-plan -->
+          Penanda inilah yang dipakai tahap pelaksanaan untuk menemukan rencana yang disetujui.
+
+          Setelah komentar terkirim, pasang label 'plan-posted':
+            gh issue edit ${{ steps.issue.outputs.number }} --add-label plan-posted
+
+          Ingat: TIDAK ada perubahan kode, TIDAK ada branch, TIDAK ada PR pada tahap ini.
+          Manusia akan me-review rencanamu lalu memberi label 'plan-approved'." \
+              --dangerously-skip-permissions; then
+              CLAUDE_EXIT=0
+            else
+              CLAUDE_EXIT=$?
+            fi
+
+            if [ $CLAUDE_EXIT -ne 0 ]; then
+              RETRY=$((RETRY+1))
+              if [ $RETRY -lt $MAX_RETRIES ]; then
+                BACKOFF=$((60 * RETRY))
+                echo "Agent gagal dengan kode $CLAUDE_EXIT. Mengulang dalam ${BACKOFF}s..."
+                sleep $BACKOFF
+                continue
+              else
+                echo "Agent gagal setelah $MAX_RETRIES percobaan"
+                exit 1
+              fi
+            fi
+
+            # Keluar 0 - verifikasi artefak (deteksi sukses palsu)
+            echo "Agent keluar 0 — memverifikasi artefak rencana..."
+            ISSUE_NUM="${{ steps.issue.outputs.number }}"
+            VERIFICATION_FAILED=false
+
+            # Cek 1: komentar berpenanda ada
+            PLAN_COMMENT_COUNT=$(gh issue view "$ISSUE_NUM" --json comments --jq '[.comments[] | select(.body | contains("<!-- agent-plan -->"))] | length')
+            echo "plan_comment_count=${PLAN_COMMENT_COUNT}" >> $GITHUB_OUTPUT
+            if [ "$PLAN_COMMENT_COUNT" -ge 1 ]; then
+              echo "OK komentar rencana berpenanda ditemukan di issue #$ISSUE_NUM"
+            else
+              echo "GAGAL tidak ada komentar berpenanda <!-- agent-plan -->"
+              VERIFICATION_FAILED=true
+            fi
+
+            # Cek 2: rencana cukup rinci. Rencana tipis berarti pelaksana yang lemah
+            # akan menebak, dan itu justru yang ingin dihindari oleh pemisahan ini.
+            PLAN_LEN=$(gh issue view "$ISSUE_NUM" --json comments \
+              --jq '[.comments[] | select(.body | contains("<!-- agent-plan -->")) | .body] | last | length')
+            [ -z "$PLAN_LEN" ] && PLAN_LEN=0
+            echo "plan_len=${PLAN_LEN}" >> $GITHUB_OUTPUT
+            echo "Panjang rencana terakhir: ${PLAN_LEN} karakter"
+            if [ "$PLAN_LEN" -lt 1500 ]; then
+              echo "::warning::Rencana hanya ${PLAN_LEN} karakter — terlalu tipis untuk dieksekusi model lemah."
+              VERIFICATION_FAILED=true
+            fi
+
+            # Cek 3: label plan-posted terpasang
+            HAS_PLAN_POSTED=$(gh issue view "$ISSUE_NUM" --json labels --jq '[.labels[].name] | contains(["plan-posted"])')
+            echo "plan_posted_label=${HAS_PLAN_POSTED}" >> $GITHUB_OUTPUT
+            if [ "$HAS_PLAN_POSTED" = "true" ]; then
+              echo "OK label plan-posted terpasang"
+            elif [ "$PLAN_COMMENT_COUNT" -ge 1 ]; then
+              echo "Label belum terpasang padahal komentar ada — memasangnya sendiri"
+              gh issue edit "$ISSUE_NUM" --add-label plan-posted
+              echo "plan_posted_label=true" >> $GITHUB_OUTPUT
+            else
+              VERIFICATION_FAILED=true
+            fi
+
+            if [ "$VERIFICATION_FAILED" = true ]; then
+              echo "::error::Agent keluar 0 tetapi verifikasi rencana gagal."
+              RETRY=$((RETRY+1))
+              if [ $RETRY -lt $MAX_RETRIES ]; then
+                BACKOFF=$((60 * RETRY))
+                echo "Mengulang dalam ${BACKOFF}s..."
+                sleep $BACKOFF
+                continue
+              else
+                echo "Verifikasi rencana gagal setelah $MAX_RETRIES percobaan"
+                exit 1
+              fi
+            fi
+
+            echo "Seluruh pemeriksaan rencana lolos"
+            exit 0
+          done
+
+      - name: Tulis Ringkasan Job
+        if: always()
+        env:
+          PLAN_COMMENT_COUNT: ${{ steps.plan.outputs.plan_comment_count }}
+          PLAN_POSTED_LABEL: ${{ steps.plan.outputs.plan_posted_label }}
+          PLAN_LEN: ${{ steps.plan.outputs.plan_len }}
+        run: |
+          ISSUE_NUM="${{ steps.issue.outputs.number }}"
+          {
+            echo "## Verifikasi Tahap Rencana"
+            echo ""
+            echo "| Pemeriksaan | Hasil |"
+            echo "|-------------|-------|"
+            echo "| Komentar \`<!-- agent-plan -->\` | $([ "${PLAN_COMMENT_COUNT:-0}" -ge 1 ] && echo "Terposting" || echo "Tidak ditemukan") |"
+            echo "| Kerincian rencana | ${PLAN_LEN:-0} karakter $([ "${PLAN_LEN:-0}" -ge 1500 ] && echo "(memadai)" || echo "(terlalu tipis)") |"
+            echo "| Label \`plan-posted\` | $([ "$PLAN_POSTED_LABEL" = "true" ] && echo "Terpasang" || echo "Belum") |"
+            echo ""
+            echo "Model perencana: \`${{ vars.PLAN_MODEL || 'agent-planning' }}\`"
+            echo ""
+            echo "Langkah berikutnya: manusia me-review rencana di issue #$ISSUE_NUM, lalu memberi label \`plan-approved\` untuk memicu pelaksanaan."
+          } >> $GITHUB_STEP_SUMMARY

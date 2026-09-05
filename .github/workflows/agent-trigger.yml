@@ -1,32 +1,24 @@
 name: Agent Trigger
 
-# Alur dua tahap (plan-approval) — human-in-the-loop naik ke level desain:
-#   1. Label 'agent-task'     -> tahap PLAN: agent post komentar rencana (<!-- agent-plan -->) + label 'plan-posted'. TIDAK ada branch/PR.
-#   2. Label 'plan-approved'  -> tahap IMPLEMENT: agent baca rencana yang disetujui, buat branch feat/acsm-issue-N, lint, PR.
-#   Bypass: label 'fast-track' -> langsung IMPLEMENT tanpa plan (untuk issue kecil).
+# Tahap PELAKSANAAN. Perencanaan sudah dipisah ke agent-plan.yml supaya kedua
+# tahap bisa memakai model berbeda: perencana memakai model kuat, pelaksana
+# memakai model murah yang hanya menerjemahkan rencana rinci menjadi kode.
 #
-# Port dari repo LPMS-3, disesuaikan untuk proyek HDL (VHDL / Verilog / SystemVerilog):
-#   - Toolchain .NET diganti toolchain HDL (Verilator, Icarus Verilog, GHDL)
-#   - Guardrail AntDesign diganti guardrail RTL (latch, CDC, blocking/non-blocking, dll)
+# Alur: label 'plan-approved' -> branch feat/acsm-issue-N -> lint -> sim -> PR
+#       label 'fast-track'    -> sama, tetapi tanpa rencana (untuk issue kecil)
+#
+# Label 'agent-task' TIDAK lagi ditangani di sini; itu milik agent-plan.yml.
 on:
   workflow_dispatch:
     inputs:
       issue_number:
-        description: 'GitHub Issue number to work on'
+        description: 'Nomor issue yang akan diimplementasikan'
         required: true
         type: string
-      mode:
-        description: 'Stage to run: plan (post rencana) or implement (langsung koding)'
-        required: false
-        default: 'plan'
-        type: choice
-        options:
-          - plan
-          - implement
   issues:
     types: [labeled]
 
-# Limit concurrent agents to avoid API rate limits
+# Batasi agen serentak untuk menghindari rate limit
 concurrency:
   group: agent-queue-${{ github.event.issue.number || github.event.inputs.issue_number }}
 
@@ -36,7 +28,6 @@ jobs:
     # Label lain di-ignore supaya job tidak jalan sia-sia.
     if: >
       github.event_name == 'workflow_dispatch' ||
-      github.event.label.name == 'agent-task' ||
       github.event.label.name == 'plan-approved' ||
       github.event.label.name == 'fast-track'
     runs-on: ubuntu-latest
@@ -68,41 +59,7 @@ jobs:
           else
             echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
           fi
-
-      # Tentukan mode (plan vs implement) dari label yang men-trigger event.
-      # KENAPA cek label 'fast-track' lagi via gh: kalau issue sudah punya fast-track
-      # lalu dilabel agent-task, kita hormati bypass-nya dan langsung implement.
-      - name: Determine Mode
-        id: mode
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-        run: |
-          MODE="plan"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            MODE="${{ github.event.inputs.mode || 'plan' }}"
-          else
-            case "${{ github.event.label.name }}" in
-              plan-approved|fast-track)
-                MODE="implement"
-                ;;
-              agent-task)
-                # Issue kecil dengan fast-track sudah terpasang -> skip tahap plan
-                HAS_FAST_TRACK=$(gh issue view "${{ steps.issue.outputs.number }}" --repo "${{ github.repository }}" --json labels --jq '[.labels[].name] | contains(["fast-track"])')
-                if [ "$HAS_FAST_TRACK" = "true" ]; then
-                  MODE="implement"
-                else
-                  MODE="plan"
-                fi
-                ;;
-            esac
-          fi
-          echo "Mode: $MODE"
-          echo "mode=$MODE" >> $GITHUB_OUTPUT
-
-      # Toolchain HDL hanya dibutuhkan tahap implement (lint/elaborate);
-      # tahap plan cukup baca kode.
       - name: Setup HDL toolchain (Verilator / Icarus / GHDL)
-        if: steps.mode.outputs.mode == 'implement'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends verilator iverilog
@@ -121,135 +78,6 @@ jobs:
           echo "Waiting ${WAIT}s to stagger API calls..."
           sleep $WAIT
 
-      # ============================================================
-      # TAHAP 1: PLAN — agent menulis rencana implementasi sebagai
-      # komentar issue, TANPA membuat branch/PR. Human review rencana,
-      # lalu memberi label 'plan-approved' untuk lanjut ke tahap 2.
-      # ============================================================
-      - name: Run Claude Code Agent (Plan)
-        if: steps.mode.outputs.mode == 'plan'
-        id: claude_plan
-        env:
-          # Gateway Anthropic-compatible. CLI menambahkan /v1/messages otomatis →
-          # URL final = https://rhkb7em.abc-tunnel.us/v1/messages
-          ANTHROPIC_BASE_URL: https://rhkb7em.abc-tunnel.us/v1
-          ANTHROPIC_AUTH_TOKEN: ${{ secrets.AGENT_API_KEY }}
-          ANTHROPIC_MODEL: agent-coding
-          ANTHROPIC_SMALL_FAST_MODEL: agent-coding
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-        run: |
-          MAX_RETRIES=3
-          RETRY=0
-
-          while [ $RETRY -lt $MAX_RETRIES ]; do
-            echo "=== Attempt $((RETRY+1)) of $MAX_RETRIES (PLAN stage) ==="
-
-            if claude -p "Read GitHub issue #${{ steps.issue.outputs.number }} using 'gh issue view ${{ steps.issue.outputs.number }}'.
-
-          You are in PLANNING mode. DO NOT write code, DO NOT create a branch, DO NOT open a PR.
-
-          This repository is a hardware design project written in VHDL, Verilog and SystemVerilog.
-          Explore the relevant sources (RTL modules, packages, testbenches, constraint files,
-          filelists such as .f, Makefile / FuseSoC / vendor project files) and docs/architecture.md
-          if it exists, then produce a concise implementation plan for this issue.
-          Read CLAUDE.md first if it exists — it holds the project's HDL conventions.
-
-          Post the plan as a comment on issue #${{ steps.issue.outputs.number }} using:
-            gh issue comment ${{ steps.issue.outputs.number }} --body '<plan>'
-
-          The comment body MUST start with the exact marker line:
-            <!-- agent-plan -->
-          (this marker is how the implement stage finds the approved plan later).
-
-          The plan must cover, in short bullet form:
-            - File yang akan disentuh (path + apa yang berubah)
-            - Hirarki modul & port map (nama modul, arah port, lebar bit)
-            - Clock & reset domain yang terlibat, termasuk CDC bila ada
-            - FSM: daftar state + transisi (bila ada)
-            - Interface/protokol yang dipakai (AXI4-Lite, APB, Avalon, Wishbone, handshake custom, dll)
-            - Rencana verifikasi: testbench mana yang dibuat/diubah, skenario apa,
-              tool yang dipakai (Icarus Verilog / Verilator / GHDL)
-            - Risiko & dependensi (timing, resource/utilisasi, dependensi modul lain)
-            - Estimasi cakupan (small/medium/large + perkiraan jumlah file)
-
-          After posting the comment, add the label 'plan-posted' to the issue:
-            gh issue edit ${{ steps.issue.outputs.number }} --add-label plan-posted
-
-          Remember: NO code changes, NO branch, NO PR at this stage. A human will review
-          the plan and add the 'plan-approved' label to trigger implementation." \
-              --dangerously-skip-permissions; then
-              CLAUDE_EXIT=0
-            else
-              CLAUDE_EXIT=$?
-            fi
-
-            if [ $CLAUDE_EXIT -ne 0 ]; then
-              RETRY=$((RETRY+1))
-              if [ $RETRY -lt $MAX_RETRIES ]; then
-                BACKOFF=$((60 * RETRY))
-                echo "Claude Code failed with exit code $CLAUDE_EXIT (likely rate limit). Retrying in ${BACKOFF}s..."
-                sleep $BACKOFF
-                continue
-              else
-                echo "Claude Code failed after $MAX_RETRIES attempts"
-                exit 1
-              fi
-            fi
-
-            # Exit 0 — verifikasi artefak tahap PLAN (false-success detection).
-            # Artefak plan = komentar dengan marker <!-- agent-plan --> + label plan-posted.
-            echo "Claude Code exited 0 — verifying plan artifacts..."
-
-            ISSUE_NUM="${{ steps.issue.outputs.number }}"
-            VERIFICATION_FAILED=false
-
-            # Check 1: komentar rencana dengan marker ada di issue
-            PLAN_COMMENT_COUNT=$(gh issue view "$ISSUE_NUM" --json comments --jq '[.comments[] | select(.body | contains("<!-- agent-plan -->"))] | length')
-            echo "plan_comment_count=${PLAN_COMMENT_COUNT}" >> $GITHUB_OUTPUT
-            if [ "$PLAN_COMMENT_COUNT" -ge 1 ]; then
-              echo "✅ Plan comment with <!-- agent-plan --> marker found on issue #$ISSUE_NUM"
-            else
-              echo "❌ No plan comment with <!-- agent-plan --> marker on issue #$ISSUE_NUM"
-              VERIFICATION_FAILED=true
-            fi
-
-            # Check 2: label plan-posted terpasang
-            HAS_PLAN_POSTED=$(gh issue view "$ISSUE_NUM" --json labels --jq '[.labels[].name] | contains(["plan-posted"])')
-            echo "plan_posted_label=${HAS_PLAN_POSTED}" >> $GITHUB_OUTPUT
-            if [ "$HAS_PLAN_POSTED" = "true" ]; then
-              echo "✅ Label 'plan-posted' present on issue #$ISSUE_NUM"
-            else
-              # Komentar ada tapi label lupa? Pasang sendiri daripada retry agent penuh —
-              # lebih murah dan hasil akhirnya sama.
-              if [ "$PLAN_COMMENT_COUNT" -ge 1 ]; then
-                echo "⚠️ Label missing but plan comment exists — adding 'plan-posted' label directly"
-                gh issue edit "$ISSUE_NUM" --add-label plan-posted
-                echo "plan_posted_label=true" >> $GITHUB_OUTPUT
-              else
-                VERIFICATION_FAILED=true
-              fi
-            fi
-
-            if [ "$VERIFICATION_FAILED" = true ]; then
-              echo "::error::Agent exited 0 but plan verification failed — no plan comment posted. Likely silent failure (gateway timeout, empty response)."
-              RETRY=$((RETRY+1))
-              if [ $RETRY -lt $MAX_RETRIES ]; then
-                BACKOFF=$((60 * RETRY))
-                echo "Retrying in ${BACKOFF}s due to verification failure..."
-                sleep $BACKOFF
-                continue
-              else
-                echo "Claude Code failed plan verification after $MAX_RETRIES attempts"
-                exit 1
-              fi
-            fi
-
-            echo "All plan verification checks passed"
-            exit 0
-          done
-
-      # ============================================================
       # TAHAP 2: IMPLEMENT — jalan saat label 'plan-approved' (rencana
       # sudah di-review human) atau 'fast-track' (bypass, issue kecil).
       # Alur: branch feat/acsm-issue-N -> implement -> lint/elaborate -> PR.
@@ -260,7 +88,7 @@ jobs:
       # tanpa gate ini, prompt implement diam-diam jatuh ke mode issue-body-only
       # (perilaku fast-track), yang mementahkan human-in-the-loop plan approval.
       - name: Preflight — Plan Comment Must Exist (plan-approved trigger)
-        if: steps.mode.outputs.mode == 'implement' && github.event.label.name == 'plan-approved'
+        if: github.event.label.name == 'plan-approved'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
@@ -277,13 +105,12 @@ jobs:
           echo "✅ Plan comment with <!-- agent-plan --> marker found — proceeding with implementation"
 
       - name: Run Claude Code Agent (Implement)
-        if: steps.mode.outputs.mode == 'implement'
         id: claude
         env:
-          ANTHROPIC_BASE_URL: https://rhkb7em.abc-tunnel.us/v1
-          ANTHROPIC_AUTH_TOKEN: ${{ secrets.AGENT_API_KEY }}
-          ANTHROPIC_MODEL: agent-coding
-          ANTHROPIC_SMALL_FAST_MODEL: agent-coding
+          ANTHROPIC_BASE_URL: ${{ vars.CODE_BASE_URL || 'https://rhkb7em.abc-tunnel.us/v1' }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.CODE_API_KEY || secrets.AGENT_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.CODE_MODEL || 'agent-coding' }}
+          ANTHROPIC_SMALL_FAST_MODEL: ${{ vars.CODE_MODEL || 'agent-coding' }}
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
@@ -456,26 +283,8 @@ jobs:
             exit 0
           done
 
-      - name: Write Job Summary (Plan)
-        if: always() && steps.mode.outputs.mode == 'plan'
-        env:
-          PLAN_COMMENT_COUNT: ${{ steps.claude_plan.outputs.plan_comment_count }}
-          PLAN_POSTED_LABEL: ${{ steps.claude_plan.outputs.plan_posted_label }}
-        run: |
-          ISSUE_NUM="${{ steps.issue.outputs.number }}"
-          {
-            echo "## Agent Verification (Plan stage)"
-            echo ""
-            echo "| Check | Status |"
-            echo "|-------|--------|"
-            echo "| Plan comment (\`<!-- agent-plan -->\`) | $([ "${PLAN_COMMENT_COUNT:-0}" -ge 1 ] && echo "✅ Posted" || echo "❌ Not found") |"
-            echo "| Label \`plan-posted\` | $([ "$PLAN_POSTED_LABEL" = "true" ] && echo "✅ Added" || echo "❌ Missing") |"
-            echo ""
-            echo "Next step: human reviews the plan on issue #$ISSUE_NUM, then adds label \`plan-approved\` to trigger implementation."
-          } >> $GITHUB_STEP_SUMMARY
-
       - name: Write Job Summary (Implement)
-        if: always() && steps.mode.outputs.mode == 'implement'
+        if: always()
         env:
           BRANCH_EXISTS: ${{ steps.claude.outputs.branch_exists }}
           PR_COUNT: ${{ steps.claude.outputs.pr_count }}
