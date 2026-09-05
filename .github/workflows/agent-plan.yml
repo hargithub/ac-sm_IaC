@@ -125,11 +125,12 @@ jobs:
       - name: Jalankan Agent Perencana
         id: plan
         env:
-          # Model perencana. Diatur lewat repository variables supaya bisa diganti
-          # tanpa menyunting workflow:
-          #   vars.PLAN_MODEL     - nama model perencana   (default: agent-planning)
-          #   vars.PLAN_BASE_URL  - endpoint gateway       (default: gateway yang sama)
-          #   secrets.PLAN_API_KEY - token khusus perencana (default: AGENT_API_KEY)
+          # Model perencana, seluruhnya dari repository variables — tanpa nilai
+          # fallback, supaya salah konfigurasi terlihat alih-alih tertutup diam-diam.
+          # Nilai kosong ditangkap lebih dulu oleh step preflight di atas.
+          #   vars.PLAN_MODEL      - nama model perencana
+          #   vars.PLAN_BASE_URL   - endpoint gateway
+          #   secrets.PLAN_API_KEY - token perencana
           ANTHROPIC_BASE_URL: ${{ vars.PLAN_BASE_URL }}
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.PLAN_API_KEY }}
           ANTHROPIC_MODEL: ${{ vars.PLAN_MODEL }}

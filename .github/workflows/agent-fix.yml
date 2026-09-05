@@ -186,7 +186,7 @@ jobs:
       - name: Preflight gateway model
         env:
           PF_BASE_URL: ${{ vars.CODE_BASE_URL }}
-          PF_TOKEN: ${{ secrets.AGENT_API_KEY }}
+          PF_TOKEN: ${{ secrets.CODE_API_KEY }}
           PF_MODEL: ${{ vars.CODE_MODEL }}
         run: |
           # Tanpa fallback, variable atau secret yang kosong akan mengirim nama model
@@ -231,7 +231,7 @@ jobs:
         env:
           # Gateway Anthropic-compatible. CLI menambahkan /v1/messages
           ANTHROPIC_BASE_URL: ${{ vars.CODE_BASE_URL }}
-          ANTHROPIC_AUTH_TOKEN: ${{ secrets.AGENT_API_KEY }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.CODE_API_KEY }}
           ANTHROPIC_MODEL: ${{ vars.CODE_MODEL }}
           ANTHROPIC_SMALL_FAST_MODEL: ${{ vars.CODE_FAST_MODEL }}
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
