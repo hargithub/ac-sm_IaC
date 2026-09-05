@@ -105,13 +105,15 @@ jobs:
 
           if [ "$RUNS" -ge 3 ]; then
             echo "::warning::Loop cap reached ($RUNS runs). Escalating to human."
-            gh pr edit ${{ steps.pr.outputs.number }} --add-label needs-human 2>/dev/null || true
+            # --repo WAJIB: step ini jalan SEBELUM checkout, jadi belum ada .git dan
+            # gh tidak bisa menebak repo dari remote (fatal: not a git repository).
+            gh pr edit ${{ steps.pr.outputs.number }} --repo ${{ github.repository }} --add-label needs-human 2>/dev/null || true
             # Post escalation comment only once (marker-deduped)
             MARKER="<!-- agent-fix-loop-cap -->"
             EXISTING=$(gh api "repos/${{ github.repository }}/issues/${{ steps.pr.outputs.number }}/comments" --paginate \
               | jq -r --arg m "$MARKER" '[.[] | select(.body | startswith($m))] | length')
             if [ "$EXISTING" = "0" ]; then
-              gh pr comment ${{ steps.pr.outputs.number }} --body "$MARKER
+              gh pr comment ${{ steps.pr.outputs.number }} --repo ${{ github.repository }} --body "$MARKER
           ⛔ **Auto-fix loop stopped after $RUNS attempts.** Reviewer/verifier findings persist that the agent could not resolve automatically. A human decision is needed — reply with \`/agent-fix <directive>\` to resume with explicit instructions, or resolve manually."
             fi
             echo "skip=true" >> $GITHUB_OUTPUT

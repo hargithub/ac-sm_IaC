@@ -382,14 +382,28 @@ jobs:
         if: steps.gate.outputs.skip == 'false' && steps.link.outputs.skip == 'false'
         env:
           AC_VERIFY_API_KEY: ${{ secrets.AC_VERIFY_API_KEY }}
+          # Model penilai AC. Sejalan dengan PLAN_MODEL dan CODE_MODEL: tanpa nilai
+          # fallback, supaya salah konfigurasi terlihat alih-alih tertutup diam-diam.
+          VERIFY_MODEL: ${{ vars.VERIFY_MODEL }}
+          VERIFY_BASE_URL: ${{ vars.VERIFY_BASE_URL }}
         run: |
+          MISSING=""
+          [ -z "$VERIFY_BASE_URL" ]   && MISSING="$MISSING VERIFY_BASE_URL"
+          [ -z "$VERIFY_MODEL" ]      && MISSING="$MISSING VERIFY_MODEL"
+          [ -z "$AC_VERIFY_API_KEY" ] && MISSING="$MISSING AC_VERIFY_API_KEY"
+          if [ -n "$MISSING" ]; then
+            echo "::error::Konfigurasi penilai AC belum lengkap, kosong:$MISSING"
+            exit 1
+          fi
+          echo "Model penilai: $VERIFY_MODEL"
+
           # OpenAI Chat Completions payload. stream:false eksplisit — sebagian
           # model default ke SSE streaming yang tidak bisa di-parse jq.
-          jq -n --rawfile sys system.txt --rawfile usr user.txt \
-            '{model:"agent-verify", messages:[{role:"system",content:$sys},{role:"user",content:$usr}], max_tokens:24000, temperature:0.2, stream:false}' > payload.json
+          jq -n --rawfile sys system.txt --rawfile usr user.txt --arg model "$VERIFY_MODEL" \
+            '{model:$model, messages:[{role:"system",content:$sys},{role:"user",content:$usr}], max_tokens:24000, temperature:0.2, stream:false}' > payload.json
 
           HTTP=$(curl -sS -o response.json -w "%{http_code}" \
-            -X POST "https://rhkb7em.abc-tunnel.us/v1/chat/completions" \
+            -X POST "${VERIFY_BASE_URL%/}/chat/completions" \
             -H "Authorization: Bearer $AC_VERIFY_API_KEY" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
@@ -429,7 +443,7 @@ jobs:
           fi
 
           echo "ok=true" >> $GITHUB_OUTPUT
-          echo "model=agent-verify" >> $GITHUB_OUTPUT
+          echo "model=$VERIFY_MODEL" >> $GITHUB_OUTPUT
           echo "vendor=verify" >> $GITHUB_OUTPUT
 
       # ─────────────────────────────────────────────────────────────────
@@ -482,13 +496,20 @@ jobs:
         if: steps.gate.outputs.skip == 'false' && steps.link.outputs.skip == 'false' && steps.agent-verify.outputs.ok == 'true'
         id: auto_fix
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GH_PAT, BUKAN GITHUB_TOKEN. GitHub tidak memicu workflow run baru dari
+          # event yang dibuat GITHUB_TOKEN, sehingga komentar '/agent-fix' yang
+          # diposting dengannya tidak pernah menyalakan agent-fix — terbukti pada
+          # PR #2: komentar terbit 11:09:34, tidak ada run agent-fix pada waktu itu.
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           PR_NUM=${{ steps.gate.outputs.pr }}
 
           # Count PARTIAL and NOT MET items in the report
-          PARTIAL=$(grep -cE '⚠️ PARTIAL' ac-report.md || true)
-          NOT_MET=$(grep -cE '❌ NOT MET' ac-report.md || true)
+          # Hanya baris TABEL yang dihitung. Tanpa jangkar '^|', baris Summary
+          # ("3 MET, 1 PARTIAL, 9 CANNOT VERIFY") ikut terhitung sehingga satu
+          # temuan dilaporkan sebagai dua.
+          PARTIAL=$(grep -cE '^[[:space:]]*\|.*⚠️ PARTIAL' ac-report.md || true)
+          NOT_MET=$(grep -cE '^[[:space:]]*\|.*❌ NOT MET' ac-report.md || true)
           TOTAL=$((PARTIAL + NOT_MET))
 
           echo "AC findings: PARTIAL=$PARTIAL  NOT_MET=$NOT_MET  total=$TOTAL"
@@ -502,7 +523,7 @@ jobs:
           echo "Found $TOTAL unmet AC items. Auto-triggering agent-fix."
 
           # Extract the failing items for the directive
-          FAILING=$(grep -E '⚠️ PARTIAL|❌ NOT MET' ac-report.md || echo "(could not extract)")
+          FAILING=$(grep -E '^[[:space:]]*\|.*(⚠️ PARTIAL|❌ NOT MET)' ac-report.md || echo "(tidak dapat diekstrak)")
 
           # Build a compact directive with the AC findings
           {

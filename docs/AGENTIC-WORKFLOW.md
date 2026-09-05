@@ -95,6 +95,8 @@ sengaja dibuat gagal cepat di preflight daripada diam-diam tertutup fallback.
 | `CODE_MODEL` | agent-trigger, agent-fix | `agent-coding` |
 | `CODE_FAST_MODEL` | agent-fix, sebagai `ANTHROPIC_SMALL_FAST_MODEL` | `coding-simple` |
 | `CODE_BASE_URL` | agent-trigger, agent-fix | gateway |
+| `VERIFY_MODEL` | ac-verify | `agent-verify` |
+| `VERIFY_BASE_URL` | ac-verify | gateway |
 
 Secret: `PLAN_API_KEY` untuk agent-plan, `CODE_API_KEY` untuk agent-trigger,
 `AGENT_API_KEY` untuk agent-fix.
@@ -185,6 +187,37 @@ Perbaikannya ada di sisi gateway, bukan workflow:
 Sejak run itu, pesan kegagalan membaca `api_error_status` dari stream dan
 menyebut penyebabnya secara spesifik, menggantikan tebakan "likely rate limit"
 yang terbawa dari LPMS-3 dan ternyata keliru.
+
+---
+
+## Pelajaran dari siklus penuh pertama (PR #2)
+
+Siklus lengkap pertama berhasil menghasilkan PR yang lolos lint dan simulasi,
+sekaligus memunculkan empat cacat yang kini sudah diperbaiki.
+
+**Loop-breaker gagal mengeskalasi.** Step *Loop breaker* di `agent-fix.yml`
+berjalan SEBELUM checkout, sementara `gh pr edit` dan `gh pr comment` di dalamnya
+tidak memakai `--repo`. Keduanya mencoba menebak repo dari git remote dan gagal
+dengan `fatal: not a git repository`, sehingga label `needs-human` tidak terpasang
+dan komentar peringatan tidak terbit — loop berhenti diam-diam tepat ketika
+manusia paling perlu diberi tahu. Tiga workflow lain aman karena checkout ada di
+step pertama.
+
+**Auto-trigger `/agent-fix` tidak menyambung.** `ac-verify` memposting komentar
+pemicu memakai `GITHUB_TOKEN`, padahal GitHub tidak memicu workflow run baru dari
+event yang dibuat token itu. Terbukti pada PR #2: komentar terbit 11:09:34, tidak
+ada run `agent-fix` pada waktu tersebut. Kini memakai `GH_PAT`.
+
+**Hitungan temuan dobel.** `grep -c '⚠️ PARTIAL'` ikut menghitung baris Summary
+yang menyebut jumlah, sehingga satu temuan dilaporkan sebagai dua. Pola kini
+dijangkar ke baris tabel (`^|`).
+
+**Model penilai terlalu lemah.** Model `agent-verify` menandai 9 dari 13 butir AC
+sebagai CANNOT VERIFY dengan alasan diff terpotong, padahal diff-nya hanya 13,8 KB
+dari batas 200 KB — utuh. Ia juga menyatakan tidak melihat pembaruan filelist yang
+sebenarnya muncul 6 kali, dan mengarang butir AC yang tidak ada di issue. Model
+penilai kini dapat diarahkan lewat `vars.VERIFY_MODEL`, sejajar dengan
+`PLAN_MODEL` dan `CODE_MODEL`.
 
 ---
 
