@@ -208,6 +208,13 @@ pemicu memakai `GITHUB_TOKEN`, padahal GitHub tidak memicu workflow run baru dar
 event yang dibuat token itu. Terbukti pada PR #2: komentar terbit 11:09:34, tidak
 ada run `agent-fix` pada waktu tersebut. Kini memakai `GH_PAT`.
 
+Perbaikan itu sempat mematikan circuit breaker: loop-breaker menentukan
+"human atau bot" dari tipe akun pemosting, sedangkan `GH_PAT` memposting sebagai
+akun manusia — sehingga cap 3 putaran ter-bypass. Deteksinya kini memakai penanda
+isi `<!-- ac-verify-autofix -->` yang disisipkan `ac-verify` pada komentar
+pemicunya, bukan tipe akun. Isi komentar dibaca lewat env, bukan interpolasi
+inline, karena isinya dikendalikan pengguna.
+
 **Hitungan temuan dobel.** `grep -c '⚠️ PARTIAL'` ikut menghitung baris Summary
 yang menyebut jumlah, sehingga satu temuan dilaporkan sebagai dua. Pola kini
 dijangkar ke baris tabel (`^|`).

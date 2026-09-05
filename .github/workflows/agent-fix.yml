@@ -79,17 +79,30 @@ jobs:
         id: loopbreak
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Lewat env, bukan interpolasi inline: isi komentar dikendalikan pengguna
+          # dan bisa menyuntik shell bila ditempel langsung ke dalam skrip.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_TYPE: ${{ github.event.comment.user.type }}
         run: |
-          # A comment event is only "human" when the author is NOT a bot.
-          # ac-verify auto-triggers post '/agent-fix' issue comments via
-          # GITHUB_TOKEN (a Bot user) — those must COUNT toward the cap,
-          # otherwise the auto-loop bypasses its own circuit breaker.
+          # Sebuah komentar dihitung "human" hanya bila penulisnya bukan bot DAN
+          # bukan auto-trigger ac-verify.
+          #
+          # Dulu cukup memeriksa tipe akun, karena ac-verify memposting lewat
+          # GITHUB_TOKEN sehingga tampak sebagai Bot. Sejak pemostingnya diganti ke
+          # GH_PAT agar event-nya menyalakan workflow, komentar itu tampak sebagai
+          # akun manusia dan akan mem-bypass cap - persis yang harus dicegah.
+          # Karena itu deteksinya kini lewat penanda isi, bukan tipe akun.
+          IS_AUTO=false
+          case "$COMMENT_BODY" in
+            *"<!-- ac-verify-autofix -->"*) IS_AUTO=true ;;
+          esac
           IS_HUMAN=false
           if { [ "${{ github.event_name }}" = "issue_comment" ] || \
                [ "${{ github.event_name }}" = "pull_request_review_comment" ]; } && \
-             [ "${{ github.event.comment.user.type }}" != "Bot" ]; then
+             [ "$COMMENT_TYPE" != "Bot" ] && [ "$IS_AUTO" = "false" ]; then
             IS_HUMAN=true
           fi
+          echo "pemicu: is_human=$IS_HUMAN is_auto=$IS_AUTO tipe=${COMMENT_TYPE:-n/a}"
 
           if [ "$IS_HUMAN" = "true" ]; then
             echo "Human-triggered — bypassing loop cap."
