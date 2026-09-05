@@ -43,18 +43,18 @@ module tb_uart_tx;
     always #(TCLK/2) clk = ~clk;
 
     // Tunggu transmitter tidak sibuk. Mencuplik setelah #1 supaya tidak balapan
-    // dengan pembaruan non-blocking di DUT.
+    // dengan pembaruan non-blocking di DUT. Dibatas-t waktu (timeout): bila tiap
+    // frame normal hanya butuh BITS*DIV clock, sebuah frame yang lama ~BITS*DIV*2
+    // pasti sudah macet (tx_busy macet tinggi) -> $fatal supaya CI tidak menggantung.
     task automatic wait_idle();
+        int t = 0;
         while (tx_busy) begin
+            if (t >= BITS * DIV * 2) begin
+                $fatal(1, "[FAIL] wait_idle timeout: tx_busy tidak pernah turun sebelum skenario berikutnya mulai");
+            end
             @(posedge clk);
             #1;
-        end
-    endtask
-
-    task automatic check_eq(input int got, input int exp, input string what);
-        if (got !== exp) begin
-            errors++;
-            $error("%s: dapat %0d, harusnya %0d", what, got, exp);
+            t++;
         end
     endtask
 
@@ -112,9 +112,10 @@ module tb_uart_tx;
                 #1;
                 t++;
             end
-            check_bit(tx_busy, 1'b0, "tx_busy turun setelah stop bit");
+            // Bila batas waktu tercapai, check_bit di atas sudah menaikkan errors;
+            // di sini tidak menaikkan errors lagi supaya satu kegagalan = satu hitungan.
             if (t >= BITS*DIV + 4)
-                errors++;  // sudah dilaporkan check_bit di atas bila busy masih 1
+                $error("tx_busy masih tinggi setelah %0d clock (watchdog timeout)", t);
 
             // Periksa frame: start 0, delapan bit data LSB lebih dulu, stop 1.
             check_bit(frame[0], 1'b0, "start bit = 0");
