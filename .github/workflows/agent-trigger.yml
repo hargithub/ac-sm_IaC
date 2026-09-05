@@ -107,10 +107,10 @@ jobs:
       - name: Run Claude Code Agent (Implement)
         id: claude
         env:
-          ANTHROPIC_BASE_URL: ${{ vars.CODE_BASE_URL || 'https://rhkb7em.abc-tunnel.us/v1' }}
-          ANTHROPIC_AUTH_TOKEN: ${{ secrets.CODE_API_KEY || secrets.AGENT_API_KEY }}
-          ANTHROPIC_MODEL: ${{ vars.CODE_MODEL || 'agent-coding' }}
-          ANTHROPIC_SMALL_FAST_MODEL: ${{ vars.CODE_MODEL || 'agent-coding' }}
+          ANTHROPIC_BASE_URL: ${{ vars.CODE_BASE_URL }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.CODE_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.CODE_MODEL }}
+          ANTHROPIC_SMALL_FAST_MODEL: ${{ vars.CODE_MODEL }}
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
