@@ -181,12 +181,11 @@ jobs:
       - name: Run Claude Code Agent Fix
         if: steps.loopbreak.outputs.skip == 'false'
         env:
-          # Gateway Anthropic-compatible. CLI menambahkan /v1/messages →
-          # URL final = https://rhkb7em.abc-tunnel.us/v1/messages
-          ANTHROPIC_BASE_URL: https://rhkb7em.abc-tunnel.us/v1
+          # Gateway Anthropic-compatible. CLI menambahkan /v1/messages
+          ANTHROPIC_BASE_URL: ${{ vars.CODE_BASE_URL }}
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.AGENT_API_KEY }}
-          ANTHROPIC_MODEL: agent-coding
-          ANTHROPIC_SMALL_FAST_MODEL: agent-coding
+          ANTHROPIC_MODEL: ${{ vars.CODE_MODEL }}
+          ANTHROPIC_SMALL_FAST_MODEL: ${{ vars.CODE_FAST_MODEL }}
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
