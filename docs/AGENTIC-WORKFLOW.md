@@ -107,6 +107,49 @@ tahap rencana tidak mengompilasi apa pun — menghemat sekitar 40 detik per run.
 
 ---
 
+## Ketahanan panggilan agent
+
+Tiga lapis pengaman membungkus setiap pemanggilan `claude -p`.
+
+**Keluaran streaming.** Pemanggilan memakai `--output-format stream-json --verbose`,
+bukan format `text` bawaan. Format bawaan hanya mencetak hasil akhir saat proses
+selesai — sehingga run yang mati di tengah tidak meninggalkan jejak apa pun di log.
+Ini persis yang terjadi pada percobaan pertama issue #1: delapan menit berjalan,
+nol baris log. Dengan streaming, tiap tool call terlihat saat terjadi.
+Catatan: `stream-json` mensyaratkan `--verbose`; tanpa itu CLI menolak jalan.
+
+**Batas waktu per percobaan.** Pemanggilan dibungkus `timeout`. Tanpa ini loop
+`MAX_RETRIES=3` hanya menyala bila agent keluar dengan kode bukan-nol secara
+cepat — bila ia MENGGANTUNG, job diam sampai batas job lalu mati, dan ketiga
+percobaan itu tidak pernah terpakai satu pun. `timeout` mengubah gantung menjadi
+exit 124 sehingga retry benar-benar berfungsi.
+
+| Workflow | Batas per percobaan | Batas job | Aritmetika |
+|---|---|---|---|
+| `agent-plan.yml` | 480 s | 30 mnt | 3 x 480 s + backoff 180 s = 27 mnt |
+| `agent-trigger.yml` | 780 s | 45 mnt | 3 x 780 s + backoff 180 s = 42 mnt |
+| `agent-fix.yml` | 480 s | 45 mnt | 3 x 480 s + backoff 900 s = 39 mnt |
+
+`set -o pipefail` dipasang agar status `claude` yang menentukan, bukan status
+`tee` yang selalu nol.
+
+**Preflight gateway.** Sebelum agent dijalankan, satu permintaan `max_tokens: 1`
+dikirim ke gateway. Kegagalan tingkat koneksi — DNS mati, koneksi ditolak —
+menghentikan job dalam hitungan detik, bukan menit. Kode HTTP hanya menjadi
+peringatan: bentuk path yang dipakai CLI bisa berbeda dari yang dicoba preflight,
+jadi 401 atau 404 sengaja tidak memblokir alur yang sebenarnya berjalan. HTTP 400
+diberi penekanan khusus karena biasanya berarti nama model tidak dikenali gateway.
+
+Yang **tidak** dipakai: checkpoint atau resume lintas-run. Direktori sesi Claude
+Code ikut terhapus bersama runner, jadi `--resume` memerlukan persistensi lewat
+cache — mahal, dan berisiko untuk HDL karena modul separuh jadi bisa lolos lint
+yang bersifat sintaksis sementara yang menangkapnya hanya `make sim`. Untuk tugas
+seukuran repo ini, mengulang dari bersih lebih aman. Bila nanti satu run rutin
+menyentuh 30 menit, bentuk yang tepat bukan pra-cek melainkan agent yang commit
+dan push bertahap sehingga branch-nya sendiri menjadi checkpoint alami.
+
+---
+
 ## Prasyarat 1 — Secrets
 
 Set di **Settings → Secrets and variables → Actions**. Nilainya sama dengan yang

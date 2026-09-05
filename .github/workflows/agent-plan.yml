@@ -74,6 +74,44 @@ jobs:
           echo "Menunggu ${WAIT}s untuk menyebar panggilan API..."
           sleep $WAIT
 
+      # Preflight: pastikan gateway model hidup dan kredensialnya diterima SEBELUM
+      # menghabiskan menit demi menit. Kegagalan tingkat koneksi (DNS mati, koneksi
+      # ditolak) dianggap fatal karena pasti menggagalkan agent. Kode HTTP hanya
+      # berupa peringatan: bentuk path yang dipakai CLI bisa berbeda dari yang
+      # dicoba di sini, jadi 401/404 tidak boleh memblokir alur yang sebenarnya jalan.
+      - name: Preflight gateway model
+        env:
+          PF_BASE_URL: ${{ vars.PLAN_BASE_URL || 'https://rhkb7em.abc-tunnel.us/v1' }}
+          PF_TOKEN: ${{ secrets.PLAN_API_KEY || secrets.AGENT_API_KEY }}
+          PF_MODEL: ${{ vars.PLAN_MODEL || 'agent-planning' }}
+        run: |
+          echo "Gateway : $PF_BASE_URL"
+          echo "Model   : $PF_MODEL"
+          set +e
+          HTTP=$(curl -sS -o /tmp/preflight.json -w "%{http_code}" --max-time 30 \
+            -X POST "${PF_BASE_URL%/}/messages" \
+            -H "x-api-key: $PF_TOKEN" \
+            -H "authorization: Bearer $PF_TOKEN" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "{\"model\":\"$PF_MODEL\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}")
+          CURL_RC=$?
+          set -e
+          if [ $CURL_RC -ne 0 ]; then
+            echo "::error::Gateway tidak dapat dihubungi (curl rc=$CURL_RC). Agent pasti gagal, dihentikan sekarang."
+            exit 1
+          fi
+          echo "HTTP $HTTP"
+          case "$HTTP" in
+            200|201) echo "Gateway sehat dan model '$PF_MODEL' dikenali." ;;
+            400)     echo "::warning::HTTP 400 — payload preflight mungkin tak cocok, atau nama model '$PF_MODEL' tidak dikenali. Lanjut, tetapi ini tersangka utama bila agent gagal."
+                     head -c 400 /tmp/preflight.json || true ;;
+            401|403) echo "::warning::HTTP $HTTP — kredensial ditolak pada path preflight. Lanjut, tetapi periksa API key bila agent gagal." ;;
+            404)     echo "::warning::HTTP 404 — path preflight berbeda dari yang dipakai CLI. Ini normal untuk sebagian gateway; diabaikan." ;;
+            *)       echo "::warning::HTTP $HTTP tak terduga."
+                     head -c 400 /tmp/preflight.json || true ;;
+          esac
+
       - name: Jalankan Agent Perencana
         id: plan
         env:
@@ -89,13 +127,20 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          # Batas waktu satu percobaan. Tanpa ini, panggilan yang MENGGANTUNG
+          # membuat job diam sampai batas job dan loop retry di bawah tidak
+          # pernah terpakai sama sekali. 3 x 480s + backoff 180s = 27 menit, muat di timeout-minutes 30.
+          AGENT_TIMEOUT=480
+          RAW_LOG=$RUNNER_TEMP/agent-stream.jsonl
+          # pipefail supaya status `claude` yang menentukan, bukan `tee`.
+          set -o pipefail
           MAX_RETRIES=3
           RETRY=0
 
           while [ $RETRY -lt $MAX_RETRIES ]; do
             echo "=== Percobaan $((RETRY+1)) dari $MAX_RETRIES (tahap PLAN) ==="
 
-            if claude -p "Baca GitHub issue #${{ steps.issue.outputs.number }} dengan 'gh issue view ${{ steps.issue.outputs.number }}'.
+            if timeout "$AGENT_TIMEOUT" claude -p "Baca GitHub issue #${{ steps.issue.outputs.number }} dengan 'gh issue view ${{ steps.issue.outputs.number }}'.
 
           Kamu berada di mode PERENCANAAN. JANGAN menulis kode, JANGAN membuat branch, JANGAN membuka PR.
 
@@ -201,10 +246,24 @@ jobs:
 
           Ingat: TIDAK ada perubahan kode, TIDAK ada branch, TIDAK ada PR pada tahap ini.
           Manusia akan me-review rencanamu lalu memberi label 'plan-approved'." \
-              --dangerously-skip-permissions; then
+              --dangerously-skip-permissions \
+              --output-format stream-json --verbose 2>&1 \
+              | tee "$RAW_LOG"; then
               CLAUDE_EXIT=0
             else
               CLAUDE_EXIT=$?
+            fi
+
+            # Ringkasan tool call dari stream. Sengaja dijalankan SETELAH exit code
+            # ditangkap, dan dibungkus `|| true`, supaya tidak bisa mengubah status.
+            if [ -s "$RAW_LOG" ]; then
+              echo "--- tool call yang dipakai agent ---"
+              jq -Rr 'fromjson? | select(.type=="assistant") | (.message.content // [])[] | select(.type=="tool_use") | .name' \
+                "$RAW_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -20 || true
+            fi
+
+            if [ $CLAUDE_EXIT -eq 124 ]; then
+              echo "::warning::Agent menggantung dan dihentikan paksa setelah ${AGENT_TIMEOUT}s. Tanpa pembungkus timeout ini, job akan diam sampai batas job dan loop retry tidak pernah terpakai."
             fi
 
             if [ $CLAUDE_EXIT -ne 0 ]; then
