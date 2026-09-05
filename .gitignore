@@ -1,0 +1,30 @@
+# Hasil simulasi
+sim/
+*.vcd
+*.out
+*.fst
+
+# Vivado - non-project mode
+build/
+*.jou
+*.log
+*.str
+*.dcp
+*.bit
+.Xil/
+vivado_pid*
+.cache/
+
+# Vivado - project mode (jangan pernah di-commit)
+*.xpr
+*.runs/
+*.sim/
+*.gen/
+*.hw/
+*.ip_user_files/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
