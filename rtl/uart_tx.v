@@ -21,10 +21,11 @@
 //     bit paling besar ~1 clock (pembulatan ke bawah); untuk 8N1, RX mencuplik
 //     di tengah tiap bit sehingga toleransi praktis ~±2% per bit (~±5%
 //     terakumulasi per frame 10 bit). Pasangan umum aman: 100 MHz/115200 ->
-//     DIV 868, galat 0,006%; 50 MHz/115200 -> DIV 434, galat 0,03%. Integrator
+//     DIV 868, galat 0,006%; 50 MHz/115200 -> DIV 434, galat 0,006%. Integrator
 //     wajib memilih CLK_HZ/BAUD yang memenuhi |1 - DIV*BAUD/CLK_HZ| <= 2%.
-//   - CLK_HZ wajib >= 2*BAUD; bila tidak, DIV = 0 dan FSM akan "mengirim" pada
-//     kecepatan clock penuh (lihat guard DIV_RAW di bawah).
+//   - CLK_HZ wajib >= 2*BAUD; bila tidak, guard DIV_RAW men-jepit DIV ke 2 agar
+//     elaborasi selalu sukses. FSM tetap berjalan, tapi tiap bit berdurasi 2 clk
+//     (baud aktual = CLK_HZ/2), jauh dari nilai diminta.
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
 `default_nettype none
@@ -44,9 +45,9 @@ module uart_tx #(
     // Pembagi baud: satu periode bit = DIV siklus clock.
     // 100e6 / 115200 = 868,055 -> dibulatkan 868 (galat 0,006%, < 2% toleransi UART).
     // Guard: CLK_HZ < 2*BAUD membuat DIV_RAW = 0 atau 1, yang membuat CNT_W/$clog2
-    // tidak valid dan FSM "mengirim" pada kecepatan clock penuh. Jepit ke 2 agar
-    // elaborasi selalu sukses; miskonfigurasi tetap kelihatan dari baud aktual
-    // (DIV=2) yang jauh dari nilai diminta, tercatat pada komentar header.
+    // tidak valid. DIV dijepit ke minimal 2 agar elaborasi selalu sukses; akibatnya
+    // tiap bit berdurasi 2 clk (baud aktual = CLK_HZ/2). Miskonfigurasi tetap
+    // kelihatan dari baud aktual yang jauh dari nilai diminta (lihat komentar header).
     localparam integer DIV_RAW = CLK_HZ / BAUD;
     localparam integer DIV     = (DIV_RAW >= 2) ? DIV_RAW : 2;
     localparam integer CNT_W   = (DIV <= 1) ? 1 : $clog2(DIV);
