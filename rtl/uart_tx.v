@@ -9,6 +9,22 @@
 //
 // Format 8N1: 1 start bit rendah, 8 bit data (LSB lebih dulu), 1 stop bit tinggi.
 // Baris idle = 1 (mark). FSM terdiri dari tepat 4 state: IDLE, START, DATA, STOP.
+//
+// KONTAK ANTARMUKA (wajib dibaca integrator):
+//   - Domain clock tunggal: clk, rst, tx_start, dan tx_data HARUS sinkron ke
+//     clock yang sama. Bila tx_start/tx_data berasal dari domain clock lain,
+//     sinkronkan dulu di luar modul ini (2-flop untuk tx_start; handshake/FIFO
+//     untuk tx_data) sebelum masuk ke sini.
+//   - tx_data wajib stabil (hold) minimal 1 siklus clk SETELAH tx_start naik:
+//     shift mencupliknya pada tepi naik yang sama dengan transisi ke START.
+//   - Ketepatan baud: pembagi integer DIV = CLK_HZ/BAUD. Galat kuantisasi per
+//     bit paling besar ~1 clock (pembulatan ke bawah); untuk 8N1, RX mencuplik
+//     di tengah tiap bit sehingga toleransi praktis ~±2% per bit (~±5%
+//     terakumulasi per frame 10 bit). Pasangan umum aman: 100 MHz/115200 ->
+//     DIV 868, galat 0,006%; 50 MHz/115200 -> DIV 434, galat 0,03%. Integrator
+//     wajib memilih CLK_HZ/BAUD yang memenuhi |1 - DIV*BAUD/CLK_HZ| <= 2%.
+//   - CLK_HZ wajib >= 2*BAUD; bila tidak, DIV = 0 dan FSM akan "mengirim" pada
+//     kecepatan clock penuh (lihat guard DIV_RAW di bawah).
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
 `default_nettype none
@@ -27,8 +43,13 @@ module uart_tx #(
 
     // Pembagi baud: satu periode bit = DIV siklus clock.
     // 100e6 / 115200 = 868,055 -> dibulatkan 868 (galat 0,006%, < 2% toleransi UART).
-    localparam integer DIV   = CLK_HZ / BAUD;
-    localparam integer CNT_W = (DIV <= 1) ? 1 : $clog2(DIV);
+    // Guard: CLK_HZ < 2*BAUD membuat DIV_RAW = 0 atau 1, yang membuat CNT_W/$clog2
+    // tidak valid dan FSM "mengirim" pada kecepatan clock penuh. Jepit ke 2 agar
+    // elaborasi selalu sukses; miskonfigurasi tetap kelihatan dari baud aktual
+    // (DIV=2) yang jauh dari nilai diminta, tercatat pada komentar header.
+    localparam integer DIV_RAW = CLK_HZ / BAUD;
+    localparam integer DIV     = (DIV_RAW >= 2) ? DIV_RAW : 2;
+    localparam integer CNT_W   = (DIV <= 1) ? 1 : $clog2(DIV);
     // DIV_M1 dipart-select ke CNT_W bit saat dipakai supaya kedua sisi == sama lebar.
     localparam integer DIV_M1 = DIV - 1;
 
