@@ -45,10 +45,11 @@ module uart_tx #(
 
     // Pembagi baud: satu periode bit = DIV siklus clock.
     // 100e6 / 115200 = 868,055 -> dibulatkan 868 (galat 0,006%, < 2% toleransi UART).
-    // Guard: CLK_HZ < 2*BAUD membuat DIV_RAW = 0 atau 1, yang membuat CNT_W/$clog2
-    // tidak valid. DIV dijepit ke minimal 2 agar elaborasi selalu sukses; akibatnya
-    // tiap bit berdurasi 2 clk (baud aktual = CLK_HZ/2). Miskonfigurasi tetap
-    // kelihatan dari baud aktual yang jauh dari nilai diminta (lihat komentar header).
+    // Guard: dengan round-to-nearest, DIV_RAW < 2 terjadi saat CLK_HZ < 1,5*BAUD
+    // (DIV_RAW = 0 atau 1), yang membuat CNT_W/$clog2 tidak valid; DIV dijepit ke
+    // minimal 2 agar elaborasi selalu sukses. Catatan: pada 1,5*BAUD <= CLK_HZ < 2*BAUD
+    // pembulatan sudah menghasilkan DIV_RAW = 2 (jepitan tidak aktif), namun baud aktual
+    // = CLK_HZ/2 tetap jauh dari nilai diminta (kontrak header: CLK_HZ wajib >= 2*BAUD).
     localparam integer DIV_RAW  = (CLK_HZ + BAUD/2) / BAUD;  // round-to-nearest
     localparam integer DIV      = (DIV_RAW >= 2) ? DIV_RAW : 2;
     localparam integer CNT_W    = (DIV <= 1) ? 1 : $clog2(DIV);
