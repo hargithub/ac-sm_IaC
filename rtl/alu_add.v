@@ -31,10 +31,15 @@ module alu_add #(
     output wire [WIDTH-1:0] result  // (a + b) mod 2^WIDTH, carry-out dibuang
 );
 
-    // Ekspresi self-determined: kedua operand sudah selebar WIDTH, jadi hasil
-    // penjumlahan juga WIDTH bit dan bit carry di atas bit ke-(WIDTH-1) hilang
-    // sebelum sampai ke result. Tidak ada truncation/extension implisit.
-    assign result = a + b;
+    // Reduksi mod 2^WIDTH dibuat EKSPLISIT lewat mask, bukan diserahkan pada
+    // aturan sizing ekspresi Verilog. Semua bit di atas bit ke-(WIDTH-1) —
+    // termasuk carry-out — dimusnahkan di titik assignment ini, sehingga lebar
+    // hasil tidak bergantung pada konteks pemakaian.
+    //
+    // Catatan: kedua operand sudah selebar WIDTH, jadi penjumlahan itu sendiri
+    // tidak pernah melampaui WIDTH bit dan mask ini tidak mengubah nilai. Ia ada
+    // sebagai penanda niat sekaligus penjaga bila kelak operand dilebarkan.
+    assign result = (a + b) & {WIDTH{1'b1}};
 
 endmodule
 

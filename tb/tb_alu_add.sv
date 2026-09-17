@@ -32,6 +32,32 @@ module tb_alu_add;
         .result (result)
     );
 
+    // Model acuan: potongan WIDTH bit dari penjumlahan presisi penuh.
+    //
+    // Port `result` DUT hanya selebar 32 bit, jadi kebocoran carry TIDAK MUNGKIN
+    // terlihat langsung di port — bit di atas bit ke-31 tidak punya tempat untuk
+    // keluar. Yang bisa dan perlu dibuktikan adalah bahwa nilai di port memang
+    // potongan 32-bit yang benar, bukan hasil lain yang kebetulan selebar 32 bit
+    // (mis. saturasi ke 0xFFFFFFFF saat carry, atau penjumlahan pada lebar yang
+    // salah). Bandingkan dengan implementasi semacam itu: keduanya gagal di sini.
+    function automatic logic [WIDTH-1:0] ref_add(input logic [WIDTH-1:0] x,
+                                                 input logic [WIDTH-1:0] y);
+        begin
+            ref_add = x + y;   // kedua operand selebar WIDTH: hasil juga WIDTH bit
+        end
+    endfunction
+
+    // Apakah x + y melewati 2^WIDTH - 1? Identitas baku untuk carry-out unsigned:
+    // carry timbul tepat ketika x > MAX - y. Dipakai untuk memastikan kasus
+    // wrap-around di TC13 memang benar-benar menghasilkan carry, sehingga
+    // pemeriksaan di sana tidak kosong.
+    function automatic logic ref_carry(input logic [WIDTH-1:0] x,
+                                       input logic [WIDTH-1:0] y);
+        begin
+            ref_carry = (x > ({WIDTH{1'b1}} - y));
+        end
+    endfunction
+
     // Tulis kedua operand, beri jeda propagasi, lalu periksa result.
     task automatic check_add(input logic [WIDTH-1:0] ta,
                              input logic [WIDTH-1:0] tb,
@@ -113,6 +139,45 @@ module tb_alu_add;
         // 33-bit dan bit ke-32 akan tampak. Ekspresi di bawah dipaksa 32-bit.
         check_add(32'hFFFFFFFF, 32'hFFFFFFFF, 32'hFFFFFFFE,
                   "TC13 carry-out benar-benar dibuang");
+
+        // TC13 diulang terhadap model acuan presisi-penuh (lihat ref_add).
+        // Ini membedakan "carry dibuang" dari "hasil dijenuhkan": implementasi
+        // yang salah menjenuhkan pada 0xFFFFFFFF saat carry akan tertangkap.
+        begin
+            logic [WIDTH-1:0] lhs;
+            logic [WIDTH-1:0] rhs;
+            logic [WIDTH-1:0] want;
+            lhs  = 32'hFFFFFFFF;
+            rhs  = 32'hFFFFFFFF;
+            want = ref_add(lhs, rhs);
+            a = lhs;
+            b = rhs;
+            #1;
+            if (result !== want) begin
+                errors++;
+                $error("TC13 ref: 0x%08h + 0x%08h -> dapat 0x%08h, harusnya 0x%08h",
+                       lhs, rhs, result, want);
+            end
+        end
+
+        // Pastikan carry-out memang BENAR-BENAR timbul pada kasus wrap-around,
+        // supaya TC13 tidak lolos hanya karena kebetulan tak ada carry. Bila
+        // model acuan tidak menghasilkan carry di sini, TC13 kehilangan makna.
+        if (ref_carry(32'hFFFFFFFF, 32'hFFFFFFFF) !== 1'b1) begin
+            errors++;
+            $error("TC13 model: carry-out tidak timbul pada 0xFFFFFFFF + 0xFFFFFFFF");
+        end
+        if (ref_carry(32'h7FFFFFFF, 32'h00000001) !== 1'b0) begin
+            errors++;
+            $error("TC13 model: carry-out timbul padahal seharusnya tidak");
+        end
+
+        // Kasus tanpa carry: model acuan harus sepakat dengan DUT di kedua sisi
+        // batas 2^31, tempat kesalahan lebar paling mudah muncul.
+        check_add(32'h7FFFFFFF, 32'h00000001, ref_add(32'h7FFFFFFF, 32'h00000001),
+                  "TC13a tanpa carry, tepat di 2^31");
+        check_add(32'h7FFFFFFE, 32'h00000001, ref_add(32'h7FFFFFFE, 32'h00000001),
+                  "TC13b tanpa carry, di bawah 2^31");
 
         // --- Skenario 14: result tidak bergantung pada nilai lama (bukan latch) ---
         // Ubah a saja, b tetap; result harus ikut berubah seketika.
