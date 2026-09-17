@@ -40,7 +40,19 @@ module shift_alu (
 
     // Kombinasional murni. Nilai default diberikan di awal blok untuk setiap
     // output, sehingga tidak ada jalur yang menyisakan nilai lama (latch).
-    always_comb begin
+    //
+    // Sengaja memakai bentuk Verilog-2001 `always @*`, BUKAN `always_comb`:
+    //   - CLAUDE.md bagian 1 menetapkan bahasa desain repo ini Verilog-2001 untuk
+    //     berkas .v, dan komentar modul di atas juga menyatakan hal yang sama.
+    //   - scripts/build.tcl membaca berkas .v lewat `read_verilog` TANPA flag -sv.
+    //     `always_comb` adalah konstruksi SystemVerilog, sehingga elaborasi Vivado
+    //     akan menolaknya dan rtl/files.f tidak akan pernah ikut tersintesis.
+    //   - Sejalan dengan rtl/counter.v dan rtl/uart_tx.v, yang keduanya memakai
+    //     bentuk `always` Verilog-2001.
+    // Sensitivitas otomatis `@*` tetap mencakup seluruh sinyal yang dibaca blok ini
+    // (op, a, shamt), dan karena semua cabang case memberi nilai ke result -- plus
+    // default di awal blok -- tidak ada jalur yang menyisakan nilai lama (latch).
+    always @* begin
         result = 32'd0;
 
         case (op)
